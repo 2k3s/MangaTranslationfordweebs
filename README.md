@@ -1,3 +1,5 @@
+<img src="AppIcon.png" width="110" /> 
+
 # Manga Translation for Dweebs / TransManga
 
 I wanted something where I could just open a manga page in my browser, put a selection box over it, and have English translations pop up right over the speech bubbles locally on my Mac.
