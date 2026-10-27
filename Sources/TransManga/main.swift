@@ -27,6 +27,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
         
+        if let icon = NSImage(named: "AppIcon")
+                 ?? NSImage(contentsOfFile: "AppIcon.png") {
+                 NSApp.applicationIconImage = icon
+             }
+        
         if !CGPreflightScreenCaptureAccess() {
             CGRequestScreenCaptureAccess()
         }
