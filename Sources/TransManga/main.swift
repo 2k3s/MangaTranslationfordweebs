@@ -24,6 +24,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let overlayController = OverlayWindowController()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        NSApp.setActivationPolicy(.regular)
+        NSApp.activate(ignoringOtherApps: true)
+        
         if !CGPreflightScreenCaptureAccess() {
             CGRequestScreenCaptureAccess()
         }
