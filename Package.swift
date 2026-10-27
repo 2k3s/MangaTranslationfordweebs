@@ -2,15 +2,15 @@
 import PackageDescription
 
 let package = Package(
-    name: "MangaLens",
+    name: "TransManga",
     platforms: [.macOS(.v13)],
     products: [
-        .executable(name: "MangaLens", targets: ["MangaLens"])
+        .executable(name: "TransManga", targets: ["TransManga"])
     ],
     targets: [
         .executableTarget(
-            name: "MangaLens",
-            path: "Sources/MangaLens"
+            name: "TransManga",
+            path: "Sources/TransManga"
         )
     ]
 )
