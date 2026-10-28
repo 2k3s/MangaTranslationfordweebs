@@ -29,16 +29,30 @@ struct OverlayTranslationBox: Identifiable {
     var isManualSelection: Bool = false
 }
 
+// MARK: - Shared Mascot Palette for the Overlay Controls
+
+private enum OverlayMascotPalette {
+    static let pearlHighlight = Color(red: 0.965, green: 0.965, blue: 0.973) // #F6F6F8
+    static let icePeriwinkle  = Color(red: 0.906, green: 0.925, blue: 0.965) // #E7ECF6
+    static let softPeriwinkle = Color(red: 0.855, green: 0.882, blue: 0.941) // #DAE1F0
+    static let pastelSkyBlue  = Color(red: 0.718, green: 0.867, blue: 0.969) // #B7DDF7
+    static let softCyanGlow   = Color(red: 0.671, green: 0.831, blue: 0.937) // #ABD4EF
+    static let vividIrisBlue  = Color(red: 0.408, green: 0.718, blue: 0.933) // #68B7EE
+    static let deepEyeBlue    = Color(red: 0.255, green: 0.467, blue: 0.643) // #4177A4
+    static let charcoalInk    = Color(red: 0.188, green: 0.227, blue: 0.267) // #303A44
+    static let graphiteText   = Color(red: 0.392, green: 0.427, blue: 0.475) // #646D79
+}
+
 final class OverlaySelectionStore: ObservableObject {
     static let shared = OverlaySelectionStore()
 
     @Published var normalizedSelection = CGRect(x: 0.15, y: 0.15, width: 0.55, height: 0.65)
     @Published var isClickThrough = false
     @Published var showTranslationCards = true
-    /// Starts OFF when the app opens
     @Published var isVisible = false
     @Published var isAutoWatching = false
     @Published var isManualSubSelectMode = false
+    @Published var overlayWindowID: CGWindowID = kCGNullWindowID
     @Published var overlayBoxes: [OverlayTranslationBox] = []
 
     var onTranslateRequested: (() -> Void)?
@@ -97,6 +111,9 @@ final class OverlayWindowController: NSObject {
             panel.setFrame(screen.frame, display: true)
         }
         panel.orderFrontRegardless()
+        if panel.windowNumber > 0 {
+            store.overlayWindowID = CGWindowID(panel.windowNumber)
+        }
     }
 
     func showOverlay() {
@@ -164,6 +181,7 @@ struct SelectionOverlayView: View {
     @State private var resizeStartRect: CGRect? = nil
     @State private var manualStartLocal: CGPoint? = nil
     @State private var manualCurrentLocal: CGPoint? = nil
+    @State private var isCornerMenuExpanded = false
 
     var body: some View {
         GeometryReader { geo in
@@ -175,37 +193,36 @@ struct SelectionOverlayView: View {
 
             ZStack(alignment: .topLeading) {
                 ZStack(alignment: .topLeading) {
-                    RoundedRectangle(cornerRadius: 10)
+                    // Region outline
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
                         .strokeBorder(
                             store.isClickThrough
-                                ? Color.green.opacity(0.45)
-                                : (store.isManualSubSelectMode ? Color.yellow.opacity(0.95) : Color.cyan.opacity(0.95)),
+                                ? OverlayMascotPalette.deepEyeBlue.opacity(0.35)
+                                : (store.isManualSubSelectMode
+                                    ? OverlayMascotPalette.vividIrisBlue.opacity(0.95)
+                                    : OverlayMascotPalette.pastelSkyBlue.opacity(0.95)),
                             style: StrokeStyle(
-                                lineWidth: store.isClickThrough ? 1.5 : 2.5,
+                                lineWidth: store.isClickThrough ? 1.4 : 2.2,
                                 dash: store.isClickThrough ? [8, 6] : (store.isManualSubSelectMode ? [6, 4] : [])
                             )
                         )
                         .background(
-                            RoundedRectangle(cornerRadius: 10)
-                                .fill(Color.black.opacity(store.isClickThrough ? 0.0 : 0.015))
+                            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                .fill(Color.black.opacity(store.isClickThrough ? 0.0 : 0.012))
                         )
 
+                    // Translated Speech Bubbles (tight per-line masks + tight text fit inside the original bubble)
                     if store.showTranslationCards {
                         ForEach(store.overlayBoxes) { box in
                             let cx = box.centerX * boxWidth
                             let cy = box.centerY * boxHeight
-                            let rawW = max(24, box.orientedWidth * boxWidth)
+                            let rawW = max(22, box.orientedWidth * boxWidth)
                             let rawH = max(18, box.orientedHeight * boxHeight)
 
-                            let isVerticalColumn = !box.isManualSelection
-                                && rawH > rawW * 1.15
-                                && abs(box.rotationRadians) < 0.05
-                            let textFrameW = box.isManualSelection
-                                ? rawW
-                                : (isVerticalColumn ? min(max(rawW * 1.35, 74), rawW + 34) : max(rawW + 8, 44))
-                            let textFrameH = box.isManualSelection
-                                ? rawH
-                                : max(rawH + 8, 22)
+                            // Keep the English text strictly within the original text bounds
+                            // so it never overflows the curved edges of the speech bubble
+                            let textFrameW = box.isManualSelection ? rawW : max(rawW + 2, 34)
+                            let textFrameH = box.isManualSelection ? rawH : max(rawH + 2, 18)
 
                             let layout = layoutMangaText(
                                 box.text.uppercased(),
@@ -214,11 +231,12 @@ struct SelectionOverlayView: View {
                             )
 
                             ZStack {
+                                // 1. Tight per-line masks that erase only the original Japanese glyphs
                                 ForEach(box.lineMasks) { mask in
-                                    let pad: CGFloat = box.isManualSelection ? 0 : 10
-                                    let mW = max(12, mask.width * boxWidth + pad)
-                                    let mH = max(12, mask.height * boxHeight + pad)
-                                    RoundedRectangle(cornerRadius: 4, style: .continuous)
+                                    let pad: CGFloat = box.isManualSelection ? 0 : 3
+                                    let mW = max(8, mask.width * boxWidth + pad)
+                                    let mH = max(8, mask.height * boxHeight + pad)
+                                    RoundedRectangle(cornerRadius: min(mW, mH) * 0.22, style: .continuous)
                                         .fill(mask.backgroundColor)
                                         .frame(width: mW, height: mH)
                                         .rotationEffect(.radians(mask.rotationRadians))
@@ -228,6 +246,7 @@ struct SelectionOverlayView: View {
                                         )
                                 }
 
+                                // 2. English text with background hugging ONLY the rendered lines (not a big outer rectangle)
                                 ZStack(alignment: .topTrailing) {
                                     VStack(spacing: 1) {
                                         ForEach(Array(layout.lines.enumerated()), id: \.offset) { _, line in
@@ -243,25 +262,35 @@ struct SelectionOverlayView: View {
                                                 .allowsTightening(true)
                                         }
                                     }
-                                    .padding(.horizontal, box.isManualSelection ? 2 : 4)
-                                    .padding(.vertical, box.isManualSelection ? 1 : 2)
-                                    .frame(width: textFrameW, height: textFrameH, alignment: .center)
+                                    .padding(.horizontal, 3)
+                                    .padding(.vertical, 1.5)
                                     .background(
-                                        RoundedRectangle(cornerRadius: 4, style: .continuous)
+                                        RoundedRectangle(cornerRadius: 6, style: .continuous)
                                             .fill(box.backgroundColor)
                                     )
+                                    .frame(width: textFrameW, height: textFrameH, alignment: .center)
 
                                     if !store.isClickThrough {
                                         Button {
                                             store.removeBox(id: box.id)
                                         } label: {
-                                            Image(systemName: "xmark.circle.fill")
-                                                .font(.system(size: 14, weight: .bold))
-                                                .foregroundStyle(.white, Color.red.opacity(0.9))
-                                                .shadow(color: .black.opacity(0.35), radius: 2, y: 1)
+                                            ZStack {
+                                                Circle()
+                                                    .fill(OverlayMascotPalette.pearlHighlight)
+                                                    .frame(width: 16, height: 16)
+                                                    .overlay(
+                                                        Circle()
+                                                            .strokeBorder(OverlayMascotPalette.deepEyeBlue.opacity(0.45), lineWidth: 0.9)
+                                                    )
+                                                Text("×")
+                                                    .font(.system(size: 11, weight: .bold, design: .rounded))
+                                                    .foregroundColor(OverlayMascotPalette.charcoalInk)
+                                                    .offset(y: -0.5)
+                                            }
+                                            .shadow(color: .black.opacity(0.18), radius: 2, y: 1)
                                         }
                                         .buttonStyle(.plain)
-                                        .offset(x: 7, y: -7)
+                                        .offset(x: 4, y: -4)
                                     }
                                 }
                                 .rotationEffect(.radians(box.rotationRadians))
@@ -270,23 +299,37 @@ struct SelectionOverlayView: View {
                         }
                     }
 
+                    // Live manual selection box while dragging with Pencil active
                     if let start = manualStartLocal, let current = manualCurrentLocal {
                         let minX = min(start.x, current.x)
                         let minY = min(start.y, current.y)
                         let w = max(4, abs(current.x - start.x))
                         let h = max(4, abs(current.y - start.y))
 
-                        RoundedRectangle(cornerRadius: 4)
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
                             .strokeBorder(
-                                Color.yellow,
+                                OverlayMascotPalette.vividIrisBlue,
                                 style: StrokeStyle(lineWidth: 2, dash: [5, 3])
                             )
                             .background(
-                                RoundedRectangle(cornerRadius: 4)
-                                    .fill(Color.yellow.opacity(0.16))
+                                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                    .fill(OverlayMascotPalette.pastelSkyBlue.opacity(0.22))
                             )
                             .frame(width: w, height: h)
                             .position(x: minX + w / 2, y: minY + h / 2)
+                    }
+
+                    // Inside Top-Right Expanding Liquid Glass Control (only when NOT in click-through mode)
+                    if !store.isClickThrough {
+                        HStack {
+                            Spacer()
+                            ExpandingTopRightOverlayMenu(
+                                isExpanded: $isCornerMenuExpanded,
+                                store: store
+                            )
+                        }
+                        .padding(.top, 12)
+                        .padding(.trailing, 12)
                     }
                 }
                 .frame(width: boxWidth, height: boxHeight)
@@ -356,75 +399,13 @@ struct SelectionOverlayView: View {
                         }
                 )
 
-                // Top floating toolbar
-                HStack(spacing: 8) {
-                    HStack(spacing: 5) {
-                        Circle()
-                            .fill(store.isClickThrough ? Color.green : (store.isManualSubSelectMode ? Color.yellow : Color.cyan))
-                            .frame(width: 8, height: 8)
-                        Text(
-                            store.isClickThrough
-                                ? "Reading (⌃⌥O)"
-                                : (store.isManualSubSelectMode ? "Drag Over Missed Text" : "Region Edit")
-                        )
-                        .font(.system(size: 11, weight: .semibold, design: .rounded))
-                    }
-
-                    if !store.isClickThrough {
-                        Button("Translate (⌃⌥M)") {
-                            store.onTranslateRequested?()
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .tint(.cyan)
-                        .controlSize(.small)
-
-                        Button(store.isManualSubSelectMode ? "Done Drawing" : "+ Draw Box") {
-                            store.isManualSubSelectMode.toggle()
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .tint(store.isManualSubSelectMode ? .yellow : .orange)
-                        .controlSize(.small)
-
-                        Button(store.isAutoWatching ? "Auto: ON (⌃⌥W)" : "Auto: OFF (⌃⌥W)") {
-                            store.onToggleAutoWatch?()
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .tint(store.isAutoWatching ? .green : .gray)
-                        .controlSize(.small)
-
-                        if !store.overlayBoxes.isEmpty {
-                            Button(store.showTranslationCards ? "Peek Raw (⌃⌥H)" : "Show EN (⌃⌥H)") {
-                                store.showTranslationCards.toggle()
-                            }
-                            .buttonStyle(.bordered)
-                            .controlSize(.small)
-                        }
-
-                        Button("Lock (⌃⌥O)") {
-                            store.isManualSubSelectMode = false
-                            store.onToggleClickThrough?()
-                        }
-                        .buttonStyle(.bordered)
-                        .controlSize(.small)
-                    }
-                }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 6)
-                .background(.ultraThinMaterial)
-                .clipShape(Capsule())
-                .overlay(
-                    Capsule()
-                        .strokeBorder(Color.white.opacity(0.22), lineWidth: 0.8)
-                )
-                .shadow(color: .black.opacity(0.25), radius: 8, y: 3)
-                .position(x: boxX + boxWidth / 2, y: max(24, boxY - 22))
-
                 // Bottom-right resize handle
                 if !store.isClickThrough {
                     Circle()
-                        .fill(Color.cyan)
-                        .frame(width: 18, height: 18)
-                        .overlay(Circle().stroke(Color.white, lineWidth: 2))
+                        .fill(OverlayMascotPalette.pastelSkyBlue)
+                        .frame(width: 16, height: 16)
+                        .overlay(Circle().stroke(Color.white, lineWidth: 1.8))
+                        .shadow(color: OverlayMascotPalette.deepEyeBlue.opacity(0.25), radius: 4, y: 2)
                         .position(x: boxX + boxWidth, y: boxY + boxHeight)
                         .gesture(
                             DragGesture()
@@ -458,7 +439,7 @@ struct SelectionOverlayView: View {
     }
 
     private func layoutMangaText(_ text: String, width: CGFloat, height: CGFloat) -> (lines: [String], fontSize: CGFloat) {
-        let usableW = max(20, width - 6)
+        let usableW = max(18, width - 6)
         let usableH = max(12, height - 4)
 
         let words = text
@@ -518,7 +499,217 @@ struct SelectionOverlayView: View {
             }
         }
 
-        let clampedFont = min(max(bestFontSize, 5.5), 22.0)
+        let clampedFont = min(max(bestFontSize, 5.5), 18.0)
         return (bestLines, clampedFont)
+    }
+}
+
+// MARK: - Inside Top-Right Expanding Liquid Glass Pill (`...` -> `[ ✏️ | Auto - あ | あ | 🔒 ]`)
+
+struct ExpandingTopRightOverlayMenu: View {
+    @Binding var isExpanded: Bool
+    @ObservedObject var store: OverlaySelectionStore
+    @State private var translateFlash = false
+    @State private var lockFlash = false
+
+    var body: some View {
+        ZStack(alignment: .trailing) {
+            Capsule(style: .continuous)
+                .fill(
+                    LinearGradient(
+                        colors: [
+                            OverlayMascotPalette.pearlHighlight.opacity(0.82),
+                            OverlayMascotPalette.icePeriwinkle.opacity(0.68),
+                            OverlayMascotPalette.pastelSkyBlue.opacity(0.42)
+                        ],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                )
+                .background(
+                    Capsule(style: .continuous)
+                        .fill(.ultraThinMaterial)
+                )
+                .overlay(
+                    Capsule(style: .continuous)
+                        .strokeBorder(
+                            LinearGradient(
+                                colors: [
+                                    Color.white.opacity(0.95),
+                                    OverlayMascotPalette.pastelSkyBlue.opacity(0.50),
+                                    Color.white.opacity(0.85)
+                                ],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            ),
+                            lineWidth: 1.0
+                        )
+                )
+                .shadow(color: OverlayMascotPalette.deepEyeBlue.opacity(0.14), radius: 10, x: 0, y: 4)
+
+            if isExpanded {
+                HStack(spacing: 6) {
+                    // 1. Pencil: Draw Manual Box
+                    OverlayPillItemButton(
+                        isActive: store.isManualSubSelectMode,
+                        action: {
+                            withAnimation(.easeOut(duration: 0.18)) {
+                                store.isManualSubSelectMode.toggle()
+                            }
+                        }
+                    ) {
+                        Image(systemName: "pencil")
+                            .font(.system(size: 13.5, weight: .semibold))
+                    }
+
+                    // 2. Auto - あ: Automatic Translation
+                    OverlayPillItemButton(
+                        isActive: store.isAutoWatching,
+                        action: {
+                            withAnimation(.easeOut(duration: 0.18)) {
+                                store.onToggleAutoWatch?()
+                            }
+                        }
+                    ) {
+                        Text("Auto - あ")
+                            .font(.system(size: 12.5, weight: .semibold, design: .rounded))
+                    }
+
+                    // 3. あ: Translate Now
+                    OverlayPillItemButton(
+                        isActive: translateFlash,
+                        action: {
+                            withAnimation(.easeInOut(duration: 0.15)) {
+                                translateFlash = true
+                            }
+                            store.onTranslateRequested?()
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                                withAnimation(.easeOut(duration: 0.2)) {
+                                    translateFlash = false
+                                }
+                            }
+                        }
+                    ) {
+                        Text("あ")
+                            .font(.system(size: 14, weight: .bold, design: .rounded))
+                    }
+
+                    // 4. Lock: Click-Through Mode
+                    OverlayPillItemButton(
+                        isActive: lockFlash,
+                        action: {
+                            withAnimation(.easeInOut(duration: 0.15)) {
+                                lockFlash = true
+                            }
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
+                                lockFlash = false
+                                isExpanded = false
+                                store.isManualSubSelectMode = false
+                                store.onToggleClickThrough?()
+                            }
+                        }
+                    ) {
+                        Image(systemName: "lock.fill")
+                            .font(.system(size: 13, weight: .semibold))
+                    }
+
+                    // Collapse button back into '...'
+                    Button {
+                        withAnimation(.spring(response: 0.34, dampingFraction: 0.80)) {
+                            isExpanded = false
+                        }
+                    } label: {
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 10.5, weight: .bold))
+                            .foregroundColor(OverlayMascotPalette.graphiteText.opacity(0.75))
+                            .frame(width: 20, height: 28)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                }
+                .padding(.horizontal, 8)
+                .transition(.opacity.combined(with: .scale(scale: 0.92, anchor: .trailing)))
+            } else {
+                Button {
+                    withAnimation(.spring(response: 0.34, dampingFraction: 0.78)) {
+                        isExpanded = true
+                    }
+                } label: {
+                    Text("...")
+                        .font(.system(size: 15, weight: .bold, design: .rounded))
+                        .foregroundColor(OverlayMascotPalette.charcoalInk)
+                        .offset(y: -2)
+                        .frame(width: 36, height: 36)
+                        .contentShape(Circle())
+                }
+                .buttonStyle(.plain)
+                .transition(.opacity)
+            }
+        }
+        .frame(width: isExpanded ? 242 : 36, height: 36)
+        .animation(.spring(response: 0.34, dampingFraction: 0.78), value: isExpanded)
+    }
+}
+
+private struct OverlayPillItemButton<Label: View>: View {
+    let isActive: Bool
+    let action: () -> Void
+    @ViewBuilder let label: () -> Label
+    @State private var isPressed = false
+
+    var body: some View {
+        Button {
+            withAnimation(.easeInOut(duration: 0.12)) {
+                isPressed = true
+            }
+            action()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.16) {
+                withAnimation(.easeOut(duration: 0.16)) {
+                    isPressed = false
+                }
+            }
+        } label: {
+            label()
+                .foregroundColor(
+                    (isActive || isPressed)
+                        ? OverlayMascotPalette.deepEyeBlue
+                        : OverlayMascotPalette.charcoalInk
+                )
+                .padding(.horizontal, 9)
+                .frame(height: 28)
+                .background(
+                    Capsule(style: .continuous)
+                        .fill(
+                            (isActive || isPressed)
+                                ? LinearGradient(
+                                    colors: [
+                                        OverlayMascotPalette.pastelSkyBlue.opacity(0.85),
+                                        OverlayMascotPalette.softCyanGlow.opacity(0.65)
+                                    ],
+                                    startPoint: .top,
+                                    endPoint: .bottom
+                                )
+                                : LinearGradient(
+                                    colors: [
+                                        Color.white.opacity(0.42),
+                                        OverlayMascotPalette.icePeriwinkle.opacity(0.22)
+                                    ],
+                                    startPoint: .top,
+                                    endPoint: .bottom
+                                )
+                        )
+                )
+                .overlay(
+                    Capsule(style: .continuous)
+                        .strokeBorder(
+                            (isActive || isPressed)
+                                ? OverlayMascotPalette.vividIrisBlue.opacity(0.55)
+                                : Color.white.opacity(0.65),
+                            lineWidth: 0.8
+                        )
+                )
+                .scaleEffect(isPressed ? 0.95 : 1.0)
+        }
+        .buttonStyle(.plain)
     }
 }

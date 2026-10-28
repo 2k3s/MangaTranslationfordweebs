@@ -29,13 +29,24 @@ struct GlossaryEntry: Identifiable, Codable, Equatable {
 }
 
 enum ScreenCapture {
-    static func captureRegion(_ rect: CGRect) -> CGImage? {
-        CGWindowListCreateImage(
-            rect,
-            .optionOnScreenOnly,
-            kCGNullWindowID,
-            [.boundsIgnoreFraming, .bestResolution]
-        )
+    /// Captures strictly beneath `belowWindowID` (the overlay NSPanel) when valid,
+    /// so our own translation bubbles and top-right menu are never captured!
+    static func captureRegion(_ rect: CGRect, belowWindowID: CGWindowID = kCGNullWindowID) -> CGImage? {
+        if belowWindowID != kCGNullWindowID {
+            return CGWindowListCreateImage(
+                rect,
+                .optionOnScreenBelowWindow,
+                belowWindowID,
+                [.boundsIgnoreFraming, .bestResolution]
+            )
+        } else {
+            return CGWindowListCreateImage(
+                rect,
+                .optionOnScreenOnly,
+                kCGNullWindowID,
+                [.boundsIgnoreFraming, .bestResolution]
+            )
+        }
     }
 }
 
@@ -723,7 +734,7 @@ enum LocalTranslator {
 @MainActor
 final class TransMangaModel: ObservableObject {
     @Published var blocks: [RecognizedBlock] = []
-    @Published var statusMessage = "Position the cyan box over a manga page and press ⌃⌥M."
+    @Published var statusMessage = "Flip ON to show the translation box, then press ⌃⌥M."
     @Published var isBusy = false
     @Published var lastCapturedImage: NSImage?
     @Published var isAutoWatching = false
@@ -794,7 +805,7 @@ final class TransMangaModel: ObservableObject {
         store.isClickThrough.toggle()
         statusMessage = store.isClickThrough
             ? "Reading mode locked (click-through ON). Press ⌃⌥O to edit box."
-            : "Edit mode active. Drag or resize the cyan box."
+            : "Edit mode active. Drag or resize the box."
     }
 
     func toggleOverlayCards() {
@@ -852,10 +863,11 @@ final class TransMangaModel: ObservableObject {
         guard isAutoWatching, store.isVisible, !isBusy else { return }
         guard let captureRect = currentCaptureRect() else { return }
 
-        let wasCardsVisible = store.showTranslationCards
-        store.showTranslationCards = false
-        guard let cgImage = ScreenCapture.captureRegion(captureRect) else {
-            store.showTranslationCards = wasCardsVisible
+        // Capture strictly beneath the overlay window so our own bubbles never trigger false page changes
+        guard let cgImage = ScreenCapture.captureRegion(
+            captureRect,
+            belowWindowID: store.overlayWindowID
+        ) else {
             return
         }
 
@@ -868,11 +880,8 @@ final class TransMangaModel: ObservableObject {
                 pendingStableTicks = 1
                 store.overlayBoxes = []
                 return
-            } else {
-                store.showTranslationCards = wasCardsVisible
             }
         } else {
-            store.showTranslationCards = wasCardsVisible
             lastVisualFingerprint = currentFP
             pendingStableTicks = 1
             return
@@ -1007,6 +1016,10 @@ final class TransMangaModel: ObservableObject {
 
     func captureAndTranslate() {
         guard !isBusy else { return }
+        guard store.isVisible else {
+            statusMessage = "Turn ON the translation box first."
+            return
+        }
         guard let captureRect = currentCaptureRect() else {
             statusMessage = "Unable to determine screen capture region."
             return
@@ -1016,12 +1029,10 @@ final class TransMangaModel: ObservableObject {
         statusMessage = "Capturing selected region..."
 
         Task {
-            let wasShowingCards = store.showTranslationCards
-            store.showTranslationCards = false
-            try? await Task.sleep(nanoseconds: 120_000_000)
-
-            guard let cgImage = ScreenCapture.captureRegion(captureRect) else {
-                store.showTranslationCards = wasShowingCards
+            guard let cgImage = ScreenCapture.captureRegion(
+                captureRect,
+                belowWindowID: store.overlayWindowID
+            ) else {
                 statusMessage = "Screen capture failed. Check Screen Recording permission in System Settings."
                 isBusy = false
                 return
@@ -1108,7 +1119,6 @@ final class TransMangaModel: ObservableObject {
                 store.showTranslationCards = true
                 statusMessage = "Translated \(detectedBlocks.count) speech bubble(s)."
             } catch {
-                store.showTranslationCards = wasShowingCards
                 statusMessage = "OCR Error: \(error.localizedDescription)"
             }
 
@@ -1116,8 +1126,6 @@ final class TransMangaModel: ObservableObject {
         }
     }
 
-    /// Captures and translates a user-drawn sub-box (`normSubRect` in 0...1 coordinates
-    /// relative to the main selection box) and keeps the translated bubble strictly inside that box.
     func translateManualSubRegion(_ normSubRect: CGRect) {
         guard !isBusy else { return }
         guard let fullCaptureRect = currentCaptureRect() else { return }
@@ -1126,12 +1134,10 @@ final class TransMangaModel: ObservableObject {
         statusMessage = "Translating manually selected box..."
 
         Task {
-            let wasShowingCards = store.showTranslationCards
-            store.showTranslationCards = false
-            try? await Task.sleep(nanoseconds: 120_000_000)
-
-            guard let fullCGImage = ScreenCapture.captureRegion(fullCaptureRect) else {
-                store.showTranslationCards = wasShowingCards
+            guard let fullCGImage = ScreenCapture.captureRegion(
+                fullCaptureRect,
+                belowWindowID: store.overlayWindowID
+            ) else {
                 statusMessage = "Screen capture failed."
                 isBusy = false
                 return
@@ -1147,7 +1153,6 @@ final class TransMangaModel: ObservableObject {
             ).integral
 
             guard let subCGImage = fullCGImage.cropping(to: cropRect) else {
-                store.showTranslationCards = wasShowingCards
                 statusMessage = "Manual selection was too small."
                 isBusy = false
                 return
@@ -1161,7 +1166,6 @@ final class TransMangaModel: ObservableObject {
                     .trimmingCharacters(in: .whitespacesAndNewlines)
 
                 guard !combinedJP.isEmpty else {
-                    store.showTranslationCards = wasShowingCards
                     statusMessage = "No Japanese text detected inside the manual box."
                     isBusy = false
                     return
@@ -1222,7 +1226,6 @@ final class TransMangaModel: ObservableObject {
                 store.showTranslationCards = true
                 statusMessage = "Added manual translation #\(nextIndex)."
             } catch {
-                store.showTranslationCards = wasShowingCards
                 statusMessage = "Manual OCR Error: \(error.localizedDescription)"
             }
 
