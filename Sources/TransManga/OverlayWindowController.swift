@@ -2,47 +2,6 @@ import SwiftUI
 import AppKit
 import Combine
 
-struct OrientedLineMask: Identifiable {
-    let id = UUID()
-    let centerX: CGFloat
-    let centerY: CGFloat
-    let width: CGFloat
-    let height: CGFloat
-    let rotationRadians: Double
-    let sampleBox: CGRect
-    var backgroundColor: Color = .white
-}
-
-struct OverlayTranslationBox: Identifiable {
-    let id = UUID()
-    let index: Int
-    let text: String
-    let boundingBox: CGRect
-    let centerX: CGFloat
-    let centerY: CGFloat
-    let orientedWidth: CGFloat
-    let orientedHeight: CGFloat
-    let rotationRadians: Double
-    let lineMasks: [OrientedLineMask]
-    let backgroundColor: Color
-    let textColor: Color
-    var isManualSelection: Bool = false
-}
-
-// MARK: - Shared Mascot Palette for the Overlay Controls
-
-private enum OverlayMascotPalette {
-    static let pearlHighlight = Color(red: 0.965, green: 0.965, blue: 0.973) // #F6F6F8
-    static let icePeriwinkle  = Color(red: 0.906, green: 0.925, blue: 0.965) // #E7ECF6
-    static let softPeriwinkle = Color(red: 0.855, green: 0.882, blue: 0.941) // #DAE1F0
-    static let pastelSkyBlue  = Color(red: 0.718, green: 0.867, blue: 0.969) // #B7DDF7
-    static let softCyanGlow   = Color(red: 0.671, green: 0.831, blue: 0.937) // #ABD4EF
-    static let vividIrisBlue  = Color(red: 0.408, green: 0.718, blue: 0.933) // #68B7EE
-    static let deepEyeBlue    = Color(red: 0.255, green: 0.467, blue: 0.643) // #4177A4
-    static let charcoalInk    = Color(red: 0.188, green: 0.227, blue: 0.267) // #303A44
-    static let graphiteText   = Color(red: 0.392, green: 0.427, blue: 0.475) // #646D79
-}
-
 final class OverlaySelectionStore: ObservableObject {
     static let shared = OverlaySelectionStore()
 
@@ -54,18 +13,27 @@ final class OverlaySelectionStore: ObservableObject {
     @Published var isManualSubSelectMode = false
     @Published var overlayWindowID: CGWindowID = kCGNullWindowID
     @Published var overlayBoxes: [OverlayTranslationBox] = []
+    @Published var selectedModel: String = "qwen2.5:7b"
+    @Published var availableModels: [String] = ["qwen2.5:7b"]
 
     var onTranslateRequested: (() -> Void)?
     var onToggleAutoWatch: (() -> Void)?
     var onToggleClickThrough: (() -> Void)?
     var onManualSubBoxSelected: ((CGRect) -> Void)?
     var onRemoveBox: ((UUID) -> Void)?
+    var onRefreshModelsRequested: (() -> Void)?
 
     private init() {}
 
     func removeBox(id: UUID) {
         overlayBoxes.removeAll { $0.id == id }
         onRemoveBox?(id)
+    }
+
+    func updateBoxText(id: UUID, newText: String) {
+        if let idx = overlayBoxes.firstIndex(where: { $0.id == id }) {
+            overlayBoxes[idx].text = newText
+        }
     }
 }
 
@@ -116,42 +84,9 @@ final class OverlayWindowController: NSObject {
         }
     }
 
-    func showOverlay() {
-        store.isVisible = true
-    }
-
-    func hideOverlay() {
-        store.isVisible = false
-    }
-
-    func toggleOverlay() {
-        store.isVisible.toggle()
-    }
-
-    func setClickThrough(_ enabled: Bool) {
-        store.isClickThrough = enabled
-        panel?.ignoresMouseEvents = enabled
-    }
-
-    func currentScreenSelectionRect() -> CGRect? {
-        guard let screen = panel?.screen ?? NSScreen.main else { return nil }
-        let screenFrame = screen.frame
-        let sel = store.normalizedSelection
-
-        let x = screenFrame.minX + sel.minX * screenFrame.width
-        let width = sel.width * screenFrame.width
-        let height = sel.height * screenFrame.height
-
-        let screenTopY = NSScreen.screens.first?.frame.height ?? screenFrame.height
-        let topDownScreenMinY = screenTopY - screenFrame.maxY
-        let y = topDownScreenMinY + sel.minY * screenFrame.height
-
-        return CGRect(x: x, y: y, width: width, height: height)
-    }
-
-    func setPanelVisibility(_ visible: Bool) {
-        store.isVisible = visible
-    }
+    func showOverlay() { store.isVisible = true }
+    func hideOverlay() { store.isVisible = false }
+    func toggleOverlay() { store.isVisible.toggle() }
 
     private func createPanel() {
         let screenFrame = NSScreen.main?.frame ?? CGRect(x: 0, y: 0, width: 1440, height: 900)
@@ -193,14 +128,13 @@ struct SelectionOverlayView: View {
 
             ZStack(alignment: .topLeading) {
                 ZStack(alignment: .topLeading) {
-                    // Region outline
                     RoundedRectangle(cornerRadius: 12, style: .continuous)
                         .strokeBorder(
                             store.isClickThrough
-                                ? OverlayMascotPalette.deepEyeBlue.opacity(0.35)
+                                ? MascotPalette.deepEyeBlue.opacity(0.35)
                                 : (store.isManualSubSelectMode
-                                    ? OverlayMascotPalette.vividIrisBlue.opacity(0.95)
-                                    : OverlayMascotPalette.pastelSkyBlue.opacity(0.95)),
+                                    ? MascotPalette.vividIrisBlue.opacity(0.95)
+                                    : MascotPalette.pastelSkyBlue.opacity(0.95)),
                             style: StrokeStyle(
                                 lineWidth: store.isClickThrough ? 1.4 : 2.2,
                                 dash: store.isClickThrough ? [8, 6] : (store.isManualSubSelectMode ? [6, 4] : [])
@@ -211,7 +145,6 @@ struct SelectionOverlayView: View {
                                 .fill(Color.black.opacity(store.isClickThrough ? 0.0 : 0.012))
                         )
 
-                    // Translated Speech Bubbles (tight per-line masks + tight text fit inside the original bubble)
                     if store.showTranslationCards {
                         ForEach(store.overlayBoxes) { box in
                             let cx = box.centerX * boxWidth
@@ -219,8 +152,6 @@ struct SelectionOverlayView: View {
                             let rawW = max(22, box.orientedWidth * boxWidth)
                             let rawH = max(18, box.orientedHeight * boxHeight)
 
-                            // Keep the English text strictly within the original text bounds
-                            // so it never overflows the curved edges of the speech bubble
                             let textFrameW = box.isManualSelection ? rawW : max(rawW + 2, 34)
                             let textFrameH = box.isManualSelection ? rawH : max(rawH + 2, 18)
 
@@ -231,7 +162,6 @@ struct SelectionOverlayView: View {
                             )
 
                             ZStack {
-                                // 1. Tight per-line masks that erase only the original Japanese glyphs
                                 ForEach(box.lineMasks) { mask in
                                     let pad: CGFloat = box.isManualSelection ? 0 : 3
                                     let mW = max(8, mask.width * boxWidth + pad)
@@ -246,7 +176,6 @@ struct SelectionOverlayView: View {
                                         )
                                 }
 
-                                // 2. English text with background hugging ONLY the rendered lines (not a big outer rectangle)
                                 ZStack(alignment: .topTrailing) {
                                     VStack(spacing: 1) {
                                         ForEach(Array(layout.lines.enumerated()), id: \.offset) { _, line in
@@ -276,15 +205,15 @@ struct SelectionOverlayView: View {
                                         } label: {
                                             ZStack {
                                                 Circle()
-                                                    .fill(OverlayMascotPalette.pearlHighlight)
+                                                    .fill(MascotPalette.pearlHighlight)
                                                     .frame(width: 16, height: 16)
                                                     .overlay(
                                                         Circle()
-                                                            .strokeBorder(OverlayMascotPalette.deepEyeBlue.opacity(0.45), lineWidth: 0.9)
+                                                            .strokeBorder(MascotPalette.deepEyeBlue.opacity(0.45), lineWidth: 0.9)
                                                     )
                                                 Text("×")
                                                     .font(.system(size: 11, weight: .bold, design: .rounded))
-                                                    .foregroundColor(OverlayMascotPalette.charcoalInk)
+                                                    .foregroundColor(MascotPalette.charcoalInk)
                                                     .offset(y: -0.5)
                                             }
                                             .shadow(color: .black.opacity(0.18), radius: 2, y: 1)
@@ -299,7 +228,6 @@ struct SelectionOverlayView: View {
                         }
                     }
 
-                    // Live manual selection box while dragging with Pencil active
                     if let start = manualStartLocal, let current = manualCurrentLocal {
                         let minX = min(start.x, current.x)
                         let minY = min(start.y, current.y)
@@ -308,18 +236,17 @@ struct SelectionOverlayView: View {
 
                         RoundedRectangle(cornerRadius: 6, style: .continuous)
                             .strokeBorder(
-                                OverlayMascotPalette.vividIrisBlue,
+                                MascotPalette.vividIrisBlue,
                                 style: StrokeStyle(lineWidth: 2, dash: [5, 3])
                             )
                             .background(
                                 RoundedRectangle(cornerRadius: 6, style: .continuous)
-                                    .fill(OverlayMascotPalette.pastelSkyBlue.opacity(0.22))
+                                    .fill(MascotPalette.pastelSkyBlue.opacity(0.22))
                             )
                             .frame(width: w, height: h)
                             .position(x: minX + w / 2, y: minY + h / 2)
                     }
 
-                    // Inside Top-Right Expanding Liquid Glass Control (only when NOT in click-through mode)
                     if !store.isClickThrough {
                         HStack {
                             Spacer()
@@ -360,14 +287,12 @@ struct SelectionOverlayView: View {
                                 let dx = value.translation.width / geo.size.width
                                 let dy = value.translation.height / geo.size.height
 
-                                var newX = min(max(0.0, start.minX + dx), 1.0 - start.width)
-                                var newY = min(max(0.0, start.minY + dy), 1.0 - start.height)
-                                newX = max(0.0, newX)
-                                newY = max(0.0, newY)
+                                let newX = min(max(0.0, start.minX + dx), 1.0 - start.width)
+                                let newY = min(max(0.0, start.minY + dy), 1.0 - start.height)
 
                                 store.normalizedSelection = CGRect(
-                                    x: newX,
-                                    y: newY,
+                                    x: max(0.0, newX),
+                                    y: max(0.0, newY),
                                     width: start.width,
                                     height: start.height
                                 )
@@ -399,13 +324,12 @@ struct SelectionOverlayView: View {
                         }
                 )
 
-                // Bottom-right resize handle
                 if !store.isClickThrough {
                     Circle()
-                        .fill(OverlayMascotPalette.pastelSkyBlue)
+                        .fill(MascotPalette.pastelSkyBlue)
                         .frame(width: 16, height: 16)
                         .overlay(Circle().stroke(Color.white, lineWidth: 1.8))
-                        .shadow(color: OverlayMascotPalette.deepEyeBlue.opacity(0.25), radius: 4, y: 2)
+                        .shadow(color: MascotPalette.deepEyeBlue.opacity(0.25), radius: 4, y: 2)
                         .position(x: boxX + boxWidth, y: boxY + boxHeight)
                         .gesture(
                             DragGesture()
@@ -442,13 +366,8 @@ struct SelectionOverlayView: View {
         let usableW = max(18, width - 6)
         let usableH = max(12, height - 4)
 
-        let words = text
-            .split(whereSeparator: { $0.isWhitespace })
-            .map(String.init)
-
-        guard !words.isEmpty else {
-            return (["..."], 10.0)
-        }
+        let words = text.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+        guard !words.isEmpty else { return (["..."], 10.0) }
 
         let longestWordLen = words.map(\.count).max() ?? 1
         let totalChars = text.count
@@ -499,12 +418,9 @@ struct SelectionOverlayView: View {
             }
         }
 
-        let clampedFont = min(max(bestFontSize, 5.5), 18.0)
-        return (bestLines, clampedFont)
+        return (bestLines, min(max(bestFontSize, 5.5), 18.0))
     }
 }
-
-// MARK: - Inside Top-Right Expanding Liquid Glass Pill (`...` -> `[ ✏️ | Auto - あ | あ | 🔒 ]`)
 
 struct ExpandingTopRightOverlayMenu: View {
     @Binding var isExpanded: Bool
@@ -518,25 +434,22 @@ struct ExpandingTopRightOverlayMenu: View {
                 .fill(
                     LinearGradient(
                         colors: [
-                            OverlayMascotPalette.pearlHighlight.opacity(0.82),
-                            OverlayMascotPalette.icePeriwinkle.opacity(0.68),
-                            OverlayMascotPalette.pastelSkyBlue.opacity(0.42)
+                            MascotPalette.pearlHighlight.opacity(0.82),
+                            MascotPalette.icePeriwinkle.opacity(0.68),
+                            MascotPalette.pastelSkyBlue.opacity(0.42)
                         ],
                         startPoint: .topLeading,
                         endPoint: .bottomTrailing
                     )
                 )
-                .background(
-                    Capsule(style: .continuous)
-                        .fill(.ultraThinMaterial)
-                )
+                .background(Capsule(style: .continuous).fill(.ultraThinMaterial))
                 .overlay(
                     Capsule(style: .continuous)
                         .strokeBorder(
                             LinearGradient(
                                 colors: [
                                     Color.white.opacity(0.95),
-                                    OverlayMascotPalette.pastelSkyBlue.opacity(0.50),
+                                    MascotPalette.pastelSkyBlue.opacity(0.50),
                                     Color.white.opacity(0.85)
                                 ],
                                 startPoint: .topLeading,
@@ -545,11 +458,10 @@ struct ExpandingTopRightOverlayMenu: View {
                             lineWidth: 1.0
                         )
                 )
-                .shadow(color: OverlayMascotPalette.deepEyeBlue.opacity(0.14), radius: 10, x: 0, y: 4)
+                .shadow(color: MascotPalette.deepEyeBlue.opacity(0.14), radius: 10, x: 0, y: 4)
 
             if isExpanded {
                 HStack(spacing: 6) {
-                    // 1. Pencil: Draw Manual Box
                     OverlayPillItemButton(
                         isActive: store.isManualSubSelectMode,
                         action: {
@@ -562,7 +474,6 @@ struct ExpandingTopRightOverlayMenu: View {
                             .font(.system(size: 13.5, weight: .semibold))
                     }
 
-                    // 2. Auto - あ: Automatic Translation
                     OverlayPillItemButton(
                         isActive: store.isAutoWatching,
                         action: {
@@ -575,7 +486,6 @@ struct ExpandingTopRightOverlayMenu: View {
                             .font(.system(size: 12.5, weight: .semibold, design: .rounded))
                     }
 
-                    // 3. あ: Translate Now
                     OverlayPillItemButton(
                         isActive: translateFlash,
                         action: {
@@ -594,7 +504,6 @@ struct ExpandingTopRightOverlayMenu: View {
                             .font(.system(size: 14, weight: .bold, design: .rounded))
                     }
 
-                    // 4. Lock: Click-Through Mode
                     OverlayPillItemButton(
                         isActive: lockFlash,
                         action: {
@@ -613,7 +522,6 @@ struct ExpandingTopRightOverlayMenu: View {
                             .font(.system(size: 13, weight: .semibold))
                     }
 
-                    // Collapse button back into '...'
                     Button {
                         withAnimation(.spring(response: 0.34, dampingFraction: 0.80)) {
                             isExpanded = false
@@ -621,7 +529,7 @@ struct ExpandingTopRightOverlayMenu: View {
                     } label: {
                         Image(systemName: "chevron.right")
                             .font(.system(size: 10.5, weight: .bold))
-                            .foregroundColor(OverlayMascotPalette.graphiteText.opacity(0.75))
+                            .foregroundColor(MascotPalette.graphiteText.opacity(0.75))
                             .frame(width: 20, height: 28)
                             .contentShape(Rectangle())
                     }
@@ -637,7 +545,7 @@ struct ExpandingTopRightOverlayMenu: View {
                 } label: {
                     Text("...")
                         .font(.system(size: 15, weight: .bold, design: .rounded))
-                        .foregroundColor(OverlayMascotPalette.charcoalInk)
+                        .foregroundColor(MascotPalette.charcoalInk)
                         .offset(y: -2)
                         .frame(width: 36, height: 36)
                         .contentShape(Circle())
@@ -659,22 +567,14 @@ private struct OverlayPillItemButton<Label: View>: View {
 
     var body: some View {
         Button {
-            withAnimation(.easeInOut(duration: 0.12)) {
-                isPressed = true
-            }
+            withAnimation(.easeInOut(duration: 0.12)) { isPressed = true }
             action()
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.16) {
-                withAnimation(.easeOut(duration: 0.16)) {
-                    isPressed = false
-                }
+                withAnimation(.easeOut(duration: 0.16)) { isPressed = false }
             }
         } label: {
             label()
-                .foregroundColor(
-                    (isActive || isPressed)
-                        ? OverlayMascotPalette.deepEyeBlue
-                        : OverlayMascotPalette.charcoalInk
-                )
+                .foregroundColor((isActive || isPressed) ? MascotPalette.deepEyeBlue : MascotPalette.charcoalInk)
                 .padding(.horizontal, 9)
                 .frame(height: 28)
                 .background(
@@ -682,18 +582,12 @@ private struct OverlayPillItemButton<Label: View>: View {
                         .fill(
                             (isActive || isPressed)
                                 ? LinearGradient(
-                                    colors: [
-                                        OverlayMascotPalette.pastelSkyBlue.opacity(0.85),
-                                        OverlayMascotPalette.softCyanGlow.opacity(0.65)
-                                    ],
+                                    colors: [MascotPalette.pastelSkyBlue.opacity(0.85), MascotPalette.softCyanGlow.opacity(0.65)],
                                     startPoint: .top,
                                     endPoint: .bottom
                                 )
                                 : LinearGradient(
-                                    colors: [
-                                        Color.white.opacity(0.42),
-                                        OverlayMascotPalette.icePeriwinkle.opacity(0.22)
-                                    ],
+                                    colors: [Color.white.opacity(0.42), MascotPalette.icePeriwinkle.opacity(0.22)],
                                     startPoint: .top,
                                     endPoint: .bottom
                                 )
@@ -702,9 +596,7 @@ private struct OverlayPillItemButton<Label: View>: View {
                 .overlay(
                     Capsule(style: .continuous)
                         .strokeBorder(
-                            (isActive || isPressed)
-                                ? OverlayMascotPalette.vividIrisBlue.opacity(0.55)
-                                : Color.white.opacity(0.65),
+                            (isActive || isPressed) ? MascotPalette.vividIrisBlue.opacity(0.55) : Color.white.opacity(0.65),
                             lineWidth: 0.8
                         )
                 )

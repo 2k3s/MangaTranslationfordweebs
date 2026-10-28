@@ -2,13 +2,6 @@ import SwiftUI
 import AppKit
 import Carbon
 
-extension Notification.Name {
-    static let transMangaTranslate = Notification.Name("transMangaTranslate")
-    static let transMangaToggleClickThrough = Notification.Name("transMangaToggleClickThrough")
-    static let transMangaToggleAutoWatch = Notification.Name("transMangaToggleAutoWatch")
-    static let transMangaToggleCards = Notification.Name("transMangaToggleCards")
-}
-
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var translateHotKeyRef: EventHotKeyRef?
     private var clickThroughHotKeyRef: EventHotKeyRef?
@@ -21,17 +14,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
 
-        let cwdIconURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-            .appendingPathComponent("AppIcon.png")
-        if let iconURL = Bundle.main.url(forResource: "AppIcon", withExtension: "icns")
-            ?? Bundle.main.url(forResource: "AppIcon", withExtension: "png")
-            ?? (FileManager.default.fileExists(atPath: cwdIconURL.path) ? cwdIconURL : nil),
-           let iconImage = NSImage(contentsOf: iconURL) {
+        if let iconImage = MascotIconLoader.loadAppIcon() {
             NSApp.applicationIconImage = iconImage
         }
 
         registerGlobalHotKey()
-        // Overlay starts OFF on launch; toggling store.isVisible shows/hides it.
     }
 
     private func registerGlobalHotKey() {
@@ -96,6 +83,60 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
+struct MenuBarControlView: View {
+    @ObservedObject var store = OverlaySelectionStore.shared
+
+    var body: some View {
+        Toggle("Translation Box ON", isOn: $store.isVisible)
+
+        Divider()
+
+        Button("Translate Now (⌃⌥M)") {
+            if !store.isVisible {
+                store.isVisible = true
+            }
+            store.onTranslateRequested?()
+        }
+
+        Toggle("Auto-Watch Mode (⌃⌥W)", isOn: Binding(
+            get: { store.isAutoWatching },
+            set: { _ in store.onToggleAutoWatch?() }
+        ))
+
+        Toggle("Reading Lock / Click-Through (⌃⌥O)", isOn: Binding(
+            get: { store.isClickThrough },
+            set: { _ in store.onToggleClickThrough?() }
+        ))
+
+        Toggle("Show Translated Bubbles (⌃⌥H)", isOn: $store.showTranslationCards)
+
+        Divider()
+
+        Picker("Ollama Model", selection: $store.selectedModel) {
+            ForEach(store.availableModels, id: \.self) { modelName in
+                Text(modelName).tag(modelName)
+            }
+        }
+
+        Button("Refresh Ollama Models") {
+            store.onRefreshModelsRequested?()
+        }
+
+        Divider()
+
+        Button("Show TransManga Window") {
+            NSApp.activate(ignoringOtherApps: true)
+            for window in NSApp.windows where !(window is NSPanel) {
+                window.makeKeyAndOrderFront(nil)
+            }
+        }
+
+        Button("Quit TransManga") {
+            NSApplication.shared.terminate(nil)
+        }
+    }
+}
+
 @main
 struct TransMangaApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
@@ -103,6 +144,10 @@ struct TransMangaApp: App {
     var body: some Scene {
         WindowGroup("TransManga") {
             ContentView()
+        }
+
+        MenuBarExtra("TransManga", systemImage: "cat.fill") {
+            MenuBarControlView()
         }
     }
 }
