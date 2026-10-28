@@ -4,15 +4,12 @@ import Combine
 
 struct OrientedLineMask: Identifiable {
     let id = UUID()
-    /// Normalized 0...1 center and oriented size relative to the captured region
     let centerX: CGFloat
     let centerY: CGFloat
     let width: CGFloat
     let height: CGFloat
     let rotationRadians: Double
-    /// Axis-aligned box in normalized 0...1 coordinates for local background color sampling
     let sampleBox: CGRect
-    /// Sampled local background color right behind this specific line
     var backgroundColor: Color = .white
 }
 
@@ -20,20 +17,16 @@ struct OverlayTranslationBox: Identifiable {
     let id = UUID()
     let index: Int
     let text: String
-    /// Axis-aligned normalized bounding box (0...1, top-left origin)
     let boundingBox: CGRect
-    /// Oriented center & size in normalized 0...1 coordinates
     let centerX: CGFloat
     let centerY: CGFloat
     let orientedWidth: CGFloat
     let orientedHeight: CGFloat
     let rotationRadians: Double
-    /// Tight per-line masks (including furigana) so all original ink is covered
     let lineMasks: [OrientedLineMask]
-    /// Sampled background color of the manga bubble
     let backgroundColor: Color
-    /// Contrasting text color (dark ink on light/grey bubbles, light ink on dark bubbles)
     let textColor: Color
+    var isManualSelection: Bool = false
 }
 
 final class OverlaySelectionStore: ObservableObject {
@@ -42,15 +35,24 @@ final class OverlaySelectionStore: ObservableObject {
     @Published var normalizedSelection = CGRect(x: 0.15, y: 0.15, width: 0.55, height: 0.65)
     @Published var isClickThrough = false
     @Published var showTranslationCards = true
-    @Published var isVisible = true
+    /// Starts OFF when the app opens
+    @Published var isVisible = false
     @Published var isAutoWatching = false
+    @Published var isManualSubSelectMode = false
     @Published var overlayBoxes: [OverlayTranslationBox] = []
 
     var onTranslateRequested: (() -> Void)?
     var onToggleAutoWatch: (() -> Void)?
     var onToggleClickThrough: (() -> Void)?
+    var onManualSubBoxSelected: ((CGRect) -> Void)?
+    var onRemoveBox: ((UUID) -> Void)?
 
     private init() {}
+
+    func removeBox(id: UUID) {
+        overlayBoxes.removeAll { $0.id == id }
+        onRemoveBox?(id)
+    }
 }
 
 final class OverlayPanel: NSPanel {
@@ -71,9 +73,22 @@ final class OverlayWindowController: NSObject {
                 self?.panel?.ignoresMouseEvents = clickThrough
             }
             .store(in: &cancellables)
+
+        store.$isVisible
+            .removeDuplicates()
+            .receive(on: RunLoop.main)
+            .sink { [weak self] visible in
+                guard let self = self else { return }
+                if visible {
+                    self.presentPanel()
+                } else {
+                    self.panel?.orderOut(nil)
+                }
+            }
+            .store(in: &cancellables)
     }
 
-    func showOverlay() {
+    private func presentPanel() {
         if panel == nil {
             createPanel()
         }
@@ -82,25 +97,18 @@ final class OverlayWindowController: NSObject {
             panel.setFrame(screen.frame, display: true)
         }
         panel.orderFrontRegardless()
+    }
+
+    func showOverlay() {
         store.isVisible = true
     }
 
     func hideOverlay() {
-        panel?.orderOut(nil)
         store.isVisible = false
     }
 
     func toggleOverlay() {
-        if panel == nil {
-            createPanel()
-        }
-        guard let panel = panel else { return }
-
-        if panel.isVisible {
-            hideOverlay()
-        } else {
-            showOverlay()
-        }
+        store.isVisible.toggle()
     }
 
     func setClickThrough(_ enabled: Bool) {
@@ -125,15 +133,7 @@ final class OverlayWindowController: NSObject {
     }
 
     func setPanelVisibility(_ visible: Bool) {
-        if panel == nil {
-            createPanel()
-        }
-        guard let panel = panel else { return }
-        if visible {
-            panel.orderFrontRegardless()
-        } else {
-            panel.orderOut(nil)
-        }
+        store.isVisible = visible
     }
 
     private func createPanel() {
@@ -162,6 +162,8 @@ struct SelectionOverlayView: View {
     @ObservedObject var store: OverlaySelectionStore
     @State private var dragStartRect: CGRect? = nil
     @State private var resizeStartRect: CGRect? = nil
+    @State private var manualStartLocal: CGPoint? = nil
+    @State private var manualCurrentLocal: CGPoint? = nil
 
     var body: some View {
         GeometryReader { geo in
@@ -177,10 +179,10 @@ struct SelectionOverlayView: View {
                         .strokeBorder(
                             store.isClickThrough
                                 ? Color.green.opacity(0.45)
-                                : Color.cyan.opacity(0.95),
+                                : (store.isManualSubSelectMode ? Color.yellow.opacity(0.95) : Color.cyan.opacity(0.95)),
                             style: StrokeStyle(
                                 lineWidth: store.isClickThrough ? 1.5 : 2.5,
-                                dash: store.isClickThrough ? [8, 6] : []
+                                dash: store.isClickThrough ? [8, 6] : (store.isManualSubSelectMode ? [6, 4] : [])
                             )
                         )
                         .background(
@@ -192,14 +194,18 @@ struct SelectionOverlayView: View {
                         ForEach(store.overlayBoxes) { box in
                             let cx = box.centerX * boxWidth
                             let cy = box.centerY * boxHeight
-                            let rawW = max(28, box.orientedWidth * boxWidth)
-                            let rawH = max(20, box.orientedHeight * boxHeight)
+                            let rawW = max(24, box.orientedWidth * boxWidth)
+                            let rawH = max(18, box.orientedHeight * boxHeight)
 
-                            let isVerticalColumn = rawH > rawW * 1.15 && abs(box.rotationRadians) < 0.05
-                            let textFrameW = isVerticalColumn
-                                ? min(max(rawW * 1.35, 74), rawW + 34)
-                                : max(rawW + 8, 44)
-                            let textFrameH = max(rawH + 8, 22)
+                            let isVerticalColumn = !box.isManualSelection
+                                && rawH > rawW * 1.15
+                                && abs(box.rotationRadians) < 0.05
+                            let textFrameW = box.isManualSelection
+                                ? rawW
+                                : (isVerticalColumn ? min(max(rawW * 1.35, 74), rawW + 34) : max(rawW + 8, 44))
+                            let textFrameH = box.isManualSelection
+                                ? rawH
+                                : max(rawH + 8, 22)
 
                             let layout = layoutMangaText(
                                 box.text.uppercased(),
@@ -208,10 +214,10 @@ struct SelectionOverlayView: View {
                             )
 
                             ZStack {
-                                // 1. Per-line masks (including furigana) using each line's exact local background color
                                 ForEach(box.lineMasks) { mask in
-                                    let mW = max(14, mask.width * boxWidth + 10)
-                                    let mH = max(14, mask.height * boxHeight + 10)
+                                    let pad: CGFloat = box.isManualSelection ? 0 : 10
+                                    let mW = max(12, mask.width * boxWidth + pad)
+                                    let mH = max(12, mask.height * boxHeight + pad)
                                     RoundedRectangle(cornerRadius: 4, style: .continuous)
                                         .fill(mask.backgroundColor)
                                         .frame(width: mW, height: mH)
@@ -222,61 +228,131 @@ struct SelectionOverlayView: View {
                                         )
                                 }
 
-                                // 2. Word-locked lines: every line has `.lineLimit(1)` so a word can NEVER split mid-word
-                                VStack(spacing: 1) {
-                                    ForEach(Array(layout.lines.enumerated()), id: \.offset) { _, line in
-                                        Text(line)
-                                            .font(.system(
-                                                size: layout.fontSize,
-                                                weight: .bold,
-                                                design: .rounded
-                                            ))
-                                            .foregroundColor(box.textColor)
-                                            .lineLimit(1)
-                                            .minimumScaleFactor(0.35)
-                                            .allowsTightening(true)
+                                ZStack(alignment: .topTrailing) {
+                                    VStack(spacing: 1) {
+                                        ForEach(Array(layout.lines.enumerated()), id: \.offset) { _, line in
+                                            Text(line)
+                                                .font(.system(
+                                                    size: layout.fontSize,
+                                                    weight: .bold,
+                                                    design: .rounded
+                                                ))
+                                                .foregroundColor(box.textColor)
+                                                .lineLimit(1)
+                                                .minimumScaleFactor(0.35)
+                                                .allowsTightening(true)
+                                        }
+                                    }
+                                    .padding(.horizontal, box.isManualSelection ? 2 : 4)
+                                    .padding(.vertical, box.isManualSelection ? 1 : 2)
+                                    .frame(width: textFrameW, height: textFrameH, alignment: .center)
+                                    .background(
+                                        RoundedRectangle(cornerRadius: 4, style: .continuous)
+                                            .fill(box.backgroundColor)
+                                    )
+
+                                    if !store.isClickThrough {
+                                        Button {
+                                            store.removeBox(id: box.id)
+                                        } label: {
+                                            Image(systemName: "xmark.circle.fill")
+                                                .font(.system(size: 14, weight: .bold))
+                                                .foregroundStyle(.white, Color.red.opacity(0.9))
+                                                .shadow(color: .black.opacity(0.35), radius: 2, y: 1)
+                                        }
+                                        .buttonStyle(.plain)
+                                        .offset(x: 7, y: -7)
                                     }
                                 }
-                                .padding(.horizontal, 4)
-                                .padding(.vertical, 2)
-                                .background(
-                                    RoundedRectangle(cornerRadius: 4, style: .continuous)
-                                        .fill(box.backgroundColor)
-                                )
-                                .frame(width: textFrameW, height: textFrameH, alignment: .center)
                                 .rotationEffect(.radians(box.rotationRadians))
                                 .position(x: cx, y: cy)
                             }
                         }
                     }
+
+                    if let start = manualStartLocal, let current = manualCurrentLocal {
+                        let minX = min(start.x, current.x)
+                        let minY = min(start.y, current.y)
+                        let w = max(4, abs(current.x - start.x))
+                        let h = max(4, abs(current.y - start.y))
+
+                        RoundedRectangle(cornerRadius: 4)
+                            .strokeBorder(
+                                Color.yellow,
+                                style: StrokeStyle(lineWidth: 2, dash: [5, 3])
+                            )
+                            .background(
+                                RoundedRectangle(cornerRadius: 4)
+                                    .fill(Color.yellow.opacity(0.16))
+                            )
+                            .frame(width: w, height: h)
+                            .position(x: minX + w / 2, y: minY + h / 2)
+                    }
                 }
                 .frame(width: boxWidth, height: boxHeight)
                 .position(x: boxX + boxWidth / 2, y: boxY + boxHeight / 2)
                 .gesture(
-                    DragGesture()
+                    DragGesture(minimumDistance: 2, coordinateSpace: .named("overlayRoot"))
                         .onChanged { value in
                             guard !store.isClickThrough else { return }
-                            if dragStartRect == nil {
-                                dragStartRect = store.normalizedSelection
+
+                            if store.isManualSubSelectMode {
+                                let startLocal = CGPoint(
+                                    x: min(max(0, value.startLocation.x - boxX), boxWidth),
+                                    y: min(max(0, value.startLocation.y - boxY), boxHeight)
+                                )
+                                let currLocal = CGPoint(
+                                    x: min(max(0, value.location.x - boxX), boxWidth),
+                                    y: min(max(0, value.location.y - boxY), boxHeight)
+                                )
+                                if manualStartLocal == nil {
+                                    manualStartLocal = startLocal
+                                }
+                                manualCurrentLocal = currLocal
+                            } else {
+                                if dragStartRect == nil {
+                                    dragStartRect = store.normalizedSelection
+                                }
+                                guard let start = dragStartRect else { return }
+                                let dx = value.translation.width / geo.size.width
+                                let dy = value.translation.height / geo.size.height
+
+                                var newX = min(max(0.0, start.minX + dx), 1.0 - start.width)
+                                var newY = min(max(0.0, start.minY + dy), 1.0 - start.height)
+                                newX = max(0.0, newX)
+                                newY = max(0.0, newY)
+
+                                store.normalizedSelection = CGRect(
+                                    x: newX,
+                                    y: newY,
+                                    width: start.width,
+                                    height: start.height
+                                )
                             }
-                            guard let start = dragStartRect else { return }
-                            let dx = value.translation.width / geo.size.width
-                            let dy = value.translation.height / geo.size.height
-
-                            var newX = min(max(0.0, start.minX + dx), 1.0 - start.width)
-                            var newY = min(max(0.0, start.minY + dy), 1.0 - start.height)
-                            newX = max(0.0, newX)
-                            newY = max(0.0, newY)
-
-                            store.normalizedSelection = CGRect(
-                                x: newX,
-                                y: newY,
-                                width: start.width,
-                                height: start.height
-                            )
                         }
                         .onEnded { _ in
-                            dragStartRect = nil
+                            if store.isManualSubSelectMode {
+                                if let start = manualStartLocal, let end = manualCurrentLocal {
+                                    let minX = min(start.x, end.x)
+                                    let minY = min(start.y, end.y)
+                                    let w = abs(end.x - start.x)
+                                    let h = abs(end.y - start.y)
+
+                                    if w >= 12 && h >= 12 {
+                                        let normSubRect = CGRect(
+                                            x: minX / boxWidth,
+                                            y: minY / boxHeight,
+                                            width: w / boxWidth,
+                                            height: h / boxHeight
+                                        )
+                                        store.onManualSubBoxSelected?(normSubRect)
+                                    }
+                                }
+                                manualStartLocal = nil
+                                manualCurrentLocal = nil
+                            } else {
+                                dragStartRect = nil
+                            }
                         }
                 )
 
@@ -284,10 +360,14 @@ struct SelectionOverlayView: View {
                 HStack(spacing: 8) {
                     HStack(spacing: 5) {
                         Circle()
-                            .fill(store.isClickThrough ? Color.green : Color.cyan)
+                            .fill(store.isClickThrough ? Color.green : (store.isManualSubSelectMode ? Color.yellow : Color.cyan))
                             .frame(width: 8, height: 8)
-                        Text(store.isClickThrough ? "Reading (⌃⌥O)" : "Region Edit")
-                            .font(.system(size: 11, weight: .semibold, design: .rounded))
+                        Text(
+                            store.isClickThrough
+                                ? "Reading (⌃⌥O)"
+                                : (store.isManualSubSelectMode ? "Drag Over Missed Text" : "Region Edit")
+                        )
+                        .font(.system(size: 11, weight: .semibold, design: .rounded))
                     }
 
                     if !store.isClickThrough {
@@ -296,6 +376,13 @@ struct SelectionOverlayView: View {
                         }
                         .buttonStyle(.borderedProminent)
                         .tint(.cyan)
+                        .controlSize(.small)
+
+                        Button(store.isManualSubSelectMode ? "Done Drawing" : "+ Draw Box") {
+                            store.isManualSubSelectMode.toggle()
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(store.isManualSubSelectMode ? .yellow : .orange)
                         .controlSize(.small)
 
                         Button(store.isAutoWatching ? "Auto: ON (⌃⌥W)" : "Auto: OFF (⌃⌥W)") {
@@ -314,6 +401,7 @@ struct SelectionOverlayView: View {
                         }
 
                         Button("Lock (⌃⌥O)") {
+                            store.isManualSubSelectMode = false
                             store.onToggleClickThrough?()
                         }
                         .buttonStyle(.bordered)
@@ -364,15 +452,14 @@ struct SelectionOverlayView: View {
                         )
                 }
             }
+            .coordinateSpace(name: "overlayRoot")
         }
         .ignoresSafeArea()
     }
 
-    /// Packs `text` into whole-word lines (never splitting a word) and computes the optimal
-    /// uniform font size that fits both horizontally and vertically inside `(width, height)`.
     private func layoutMangaText(_ text: String, width: CGFloat, height: CGFloat) -> (lines: [String], fontSize: CGFloat) {
-        let usableW = max(24, width - 8)
-        let usableH = max(14, height - 4)
+        let usableW = max(20, width - 6)
+        let usableH = max(12, height - 4)
 
         let words = text
             .split(whereSeparator: { $0.isWhitespace })
@@ -387,7 +474,7 @@ struct SelectionOverlayView: View {
         let refFont = NSFont.systemFont(ofSize: 10.0, weight: .bold)
 
         var bestLines: [String] = words
-        var bestFontSize: CGFloat = 6.0
+        var bestFontSize: CGFloat = 5.5
 
         let minTarget = max(longestWordLen, 4)
         let maxTarget = max(minTarget, min(totalChars, 28))
@@ -410,7 +497,6 @@ struct SelectionOverlayView: View {
                 candidateLines.append(currentLine)
             }
 
-            // Measure widest line at 10pt reference font
             var maxLineWidthAt10: CGFloat = 1.0
             for line in candidateLines {
                 let measured = (line as NSString).size(withAttributes: [.font: refFont]).width
@@ -419,7 +505,6 @@ struct SelectionOverlayView: View {
                 }
             }
 
-            // Add 6% safety margin for rounded design glyph width
             let safeWidthAt10 = maxLineWidthAt10 * 1.06
             let totalHeightAt10 = CGFloat(candidateLines.count) * 12.2
 
@@ -433,7 +518,7 @@ struct SelectionOverlayView: View {
             }
         }
 
-        let clampedFont = min(max(bestFontSize, 6.0), 22.0)
+        let clampedFont = min(max(bestFontSize, 5.5), 22.0)
         return (bestLines, clampedFont)
     }
 }

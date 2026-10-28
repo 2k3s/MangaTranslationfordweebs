@@ -21,14 +21,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
 
+        let cwdIconURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent("AppIcon.png")
         if let iconURL = Bundle.main.url(forResource: "AppIcon", withExtension: "icns")
-            ?? Bundle.main.url(forResource: "AppIcon", withExtension: "png"),
+            ?? Bundle.main.url(forResource: "AppIcon", withExtension: "png")
+            ?? (FileManager.default.fileExists(atPath: cwdIconURL.path) ? cwdIconURL : nil),
            let iconImage = NSImage(contentsOf: iconURL) {
             NSApp.applicationIconImage = iconImage
         }
 
         registerGlobalHotKey()
-        overlayController.showOverlay()
+        // Overlay starts OFF on launch; toggling store.isVisible shows/hides it.
     }
 
     private func registerGlobalHotKey() {
@@ -79,19 +82,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let modifiers = UInt32(controlKey | optionKey)
 
-        // ⌃⌥M -> Translate Now (id: 1)
         let translateID = EventHotKeyID(signature: OSType(0x544D4731), id: 1)
         RegisterEventHotKey(UInt32(kVK_ANSI_M), modifiers, translateID, GetApplicationEventTarget(), 0, &translateHotKeyRef)
 
-        // ⌃⌥O -> Toggle Click-Through / Reading Mode (id: 2)
         let clickThroughID = EventHotKeyID(signature: OSType(0x544D4732), id: 2)
         RegisterEventHotKey(UInt32(kVK_ANSI_O), modifiers, clickThroughID, GetApplicationEventTarget(), 0, &clickThroughHotKeyRef)
 
-        // ⌃⌥W -> Toggle Auto-Watch (id: 3)
         let autoWatchID = EventHotKeyID(signature: OSType(0x544D4733), id: 3)
         RegisterEventHotKey(UInt32(kVK_ANSI_W), modifiers, autoWatchID, GetApplicationEventTarget(), 0, &autoWatchHotKeyRef)
 
-        // ⌃⌥H -> Peek Original / Hide Cards (id: 4)
         let peekID = EventHotKeyID(signature: OSType(0x544D4734), id: 4)
         RegisterEventHotKey(UInt32(kVK_ANSI_H), modifiers, peekID, GetApplicationEventTarget(), 0, &peekCardsHotKeyRef)
     }
@@ -105,6 +104,5 @@ struct TransMangaApp: App {
         WindowGroup("TransManga") {
             ContentView()
         }
-        .windowStyle(.hiddenTitleBar)
     }
 }

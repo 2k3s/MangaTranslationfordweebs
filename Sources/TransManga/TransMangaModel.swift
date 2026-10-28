@@ -390,9 +390,6 @@ enum MangaOCR {
             let maxColThickness = cluster.map { min($0.mask.width, $0.mask.height) }.max() ?? 0
             let maxColLength = cluster.map { max($0.mask.width, $0.mask.height) }.max() ?? 0
 
-            // Only filter out a line from the OCR transcript if it is BOTH much thinner
-            // AND much shorter than the main dialogue column (true furigana ruby gloss),
-            // so full-height hiragana lines like "すみません" are never dropped!
             let filteredLines: [RawLine]
             if cluster.count > 1 {
                 let mainColumns = cluster.filter { line in
@@ -427,8 +424,6 @@ enum MangaOCR {
             let combinedText = sortedLines.map(\.text).joined()
             guard !combinedText.isEmpty else { continue }
 
-            // Use ALL corners in `cluster` (including furigana) so the oriented bounds
-            // and `lineMasks` completely cover every single original character & ruby gloss.
             let allCorners = cluster.flatMap(\.corners)
             let clusterMask = computeOrientedMask(
                 corners: allCorners,
@@ -456,7 +451,7 @@ enum MangaOCR {
             let verticalOverlap = min(a.box.maxY, b.box.maxY) - max(a.box.minY, b.box.minY)
             let minH = min(a.box.height, b.box.height)
             if verticalOverlap > minH * 0.25 {
-                return a.box.midX > b.box.minX
+                return a.box.midX > b.box.midX
             }
             return a.box.minY < b.box.minY
         }
@@ -762,6 +757,14 @@ final class TransMangaModel: ObservableObject {
                 self?.toggleClickThrough()
             }
         }
+        store.onManualSubBoxSelected = { [weak self] normSubRect in
+            Task { @MainActor in
+                self?.translateManualSubRegion(normSubRect)
+            }
+        }
+        store.onRemoveBox = { [weak self] id in
+            self?.blocks.removeAll { $0.id == id }
+        }
     }
 
     func addGlossaryEntry() {
@@ -918,9 +921,6 @@ final class TransMangaModel: ObservableObject {
         return Double(totalDiff) / Double(a.count * 255)
     }
 
-    /// Samples the true local paper/screentone background color inside `normalizedBox`
-    /// by averaging the 65th–85th percentile luminance pixels (ignoring the darkest ~30% ink glyphs)
-    /// without clamping light greys/off-whites to pure white.
     private static func sampleBubbleAppearance(in cgImage: CGImage, normalizedBox: CGRect) -> (bg: Color, fg: Color) {
         let imgW = CGFloat(cgImage.width)
         let imgH = CGFloat(cgImage.height)
@@ -972,13 +972,9 @@ final class TransMangaModel: ObservableObject {
         let endIdx: Int
 
         if medianLum >= 0.36 {
-            // Dark text on white, off-white, or grey screentone background:
-            // Average the 65th–85th percentile pixels to capture the exact paper/screentone shade
             startIdx = Int(Double(pixels.count - 1) * 0.65)
             endIdx = max(startIdx, Int(Double(pixels.count - 1) * 0.85))
         } else {
-            // Light text on dark/black flashback background:
-            // Average the 15th–35th percentile pixels to capture the dark fill
             startIdx = Int(Double(pixels.count - 1) * 0.15)
             endIdx = max(startIdx, Int(Double(pixels.count - 1) * 0.35))
         }
@@ -1048,7 +1044,6 @@ final class TransMangaModel: ObservableObject {
                     return
                 }
 
-                // Sample both the overall bubble color and each individual line mask's local background color
                 var appearances: [(bg: Color, fg: Color)] = []
                 for i in 0..<detectedBlocks.count {
                     let bubbleColor = Self.sampleBubbleAppearance(
@@ -1106,7 +1101,8 @@ final class TransMangaModel: ObservableObject {
                         rotationRadians: block.rotationRadians,
                         lineMasks: block.lineMasks,
                         backgroundColor: appearances[i].bg,
-                        textColor: appearances[i].fg
+                        textColor: appearances[i].fg,
+                        isManualSelection: false
                     )
                 }
                 store.showTranslationCards = true
@@ -1114,6 +1110,120 @@ final class TransMangaModel: ObservableObject {
             } catch {
                 store.showTranslationCards = wasShowingCards
                 statusMessage = "OCR Error: \(error.localizedDescription)"
+            }
+
+            isBusy = false
+        }
+    }
+
+    /// Captures and translates a user-drawn sub-box (`normSubRect` in 0...1 coordinates
+    /// relative to the main selection box) and keeps the translated bubble strictly inside that box.
+    func translateManualSubRegion(_ normSubRect: CGRect) {
+        guard !isBusy else { return }
+        guard let fullCaptureRect = currentCaptureRect() else { return }
+
+        isBusy = true
+        statusMessage = "Translating manually selected box..."
+
+        Task {
+            let wasShowingCards = store.showTranslationCards
+            store.showTranslationCards = false
+            try? await Task.sleep(nanoseconds: 120_000_000)
+
+            guard let fullCGImage = ScreenCapture.captureRegion(fullCaptureRect) else {
+                store.showTranslationCards = wasShowingCards
+                statusMessage = "Screen capture failed."
+                isBusy = false
+                return
+            }
+
+            let imgW = CGFloat(fullCGImage.width)
+            let imgH = CGFloat(fullCGImage.height)
+            let cropRect = CGRect(
+                x: max(0, normSubRect.minX * imgW),
+                y: max(0, normSubRect.minY * imgH),
+                width: min(imgW - max(0, normSubRect.minX * imgW), max(8, normSubRect.width * imgW)),
+                height: min(imgH - max(0, normSubRect.minY * imgH), max(8, normSubRect.height * imgH))
+            ).integral
+
+            guard let subCGImage = fullCGImage.cropping(to: cropRect) else {
+                store.showTranslationCards = wasShowingCards
+                statusMessage = "Manual selection was too small."
+                isBusy = false
+                return
+            }
+
+            do {
+                let subClusters = try await MangaOCR.recognizeBubbleClusters(from: subCGImage)
+                let combinedJP = subClusters
+                    .map(\.japaneseText)
+                    .joined(separator: " ")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+
+                guard !combinedJP.isEmpty else {
+                    store.showTranslationCards = wasShowingCards
+                    statusMessage = "No Japanese text detected inside the manual box."
+                    isBusy = false
+                    return
+                }
+
+                let english: String
+                if let cached = bubbleCache[combinedJP] {
+                    english = cached
+                } else {
+                    let translated = await LocalTranslator.translateBubbles([combinedJP], glossary: glossary)
+                    english = translated.first ?? "..."
+                    bubbleCache[combinedJP] = english
+                }
+
+                let appearance = Self.sampleBubbleAppearance(in: fullCGImage, normalizedBox: normSubRect)
+                let nextIndex = (store.overlayBoxes.map(\.index).max() ?? 0) + 1
+
+                let manualMask = OrientedLineMask(
+                    centerX: normSubRect.midX,
+                    centerY: normSubRect.midY,
+                    width: normSubRect.width,
+                    height: normSubRect.height,
+                    rotationRadians: 0,
+                    sampleBox: normSubRect,
+                    backgroundColor: appearance.bg
+                )
+
+                let newBox = OverlayTranslationBox(
+                    index: nextIndex,
+                    text: english,
+                    boundingBox: normSubRect,
+                    centerX: normSubRect.midX,
+                    centerY: normSubRect.midY,
+                    orientedWidth: normSubRect.width,
+                    orientedHeight: normSubRect.height,
+                    rotationRadians: 0,
+                    lineMasks: [manualMask],
+                    backgroundColor: appearance.bg,
+                    textColor: appearance.fg,
+                    isManualSelection: true
+                )
+
+                let newBlock = RecognizedBlock(
+                    index: nextIndex,
+                    japaneseText: combinedJP,
+                    englishText: english,
+                    boundingBox: normSubRect,
+                    centerX: normSubRect.midX,
+                    centerY: normSubRect.midY,
+                    orientedWidth: normSubRect.width,
+                    orientedHeight: normSubRect.height,
+                    rotationRadians: 0,
+                    lineMasks: [manualMask]
+                )
+
+                blocks.append(newBlock)
+                store.overlayBoxes.append(newBox)
+                store.showTranslationCards = true
+                statusMessage = "Added manual translation #\(nextIndex)."
+            } catch {
+                store.showTranslationCards = wasShowingCards
+                statusMessage = "Manual OCR Error: \(error.localizedDescription)"
             }
 
             isBusy = false
