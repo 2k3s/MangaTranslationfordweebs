@@ -50,11 +50,13 @@ struct VisionKitMangaOCRService: OCRRecognizing {
             }
         }
 
-        let fullTranscript = analysis.transcript
-            .components(separatedBy: .newlines)
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-            .joined(separator: " ")
+        let fullTranscript = Self.cleanVerticalOCRArtifacts(
+            analysis.transcript
+                .components(separatedBy: .newlines)
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+                .joined(separator: " ")
+        )
 
         guard !fullTranscript.isEmpty else { return [] }
         let fallbackBox = CGRect(x: 0.1, y: 0.1, width: 0.8, height: 0.8)
@@ -354,18 +356,16 @@ struct VisionKitMangaOCRService: OCRRecognizing {
             let unionBox = cluster.reduce(cluster[0].box) { $0.union($1.box) }
 
             let maxColThickness = cluster.map { min($0.mask.width, $0.mask.height) }.max() ?? 0
-            let maxColLength = cluster.map { max($0.mask.width, $0.mask.height) }.max() ?? 0
+            let kanjiLines = cluster.filter { containsKanji($0.text) }
 
             let filteredLines: [RawLine]
             if cluster.count > 1 {
                 let mainColumns = cluster.filter { line in
-                    let thickness = min(line.mask.width, line.mask.height)
-                    let length = max(line.mask.width, line.mask.height)
-                    let isTinyFurigana = thickness < maxColThickness * 0.52
-                        && length < maxColLength * 0.55
-                        && line.text.count <= 4
-                        && isPureHiragana(line.text)
-                    return !isTinyFurigana
+                    !isFuriganaGloss(
+                        line,
+                        kanjiLines: kanjiLines,
+                        maxColThickness: maxColThickness
+                    )
                 }
                 filteredLines = mainColumns.isEmpty ? cluster : mainColumns
             } else {
@@ -387,7 +387,8 @@ struct VisionKitMangaOCRService: OCRRecognizing {
                 }
             }
 
-            let combinedText = sortedLines.map(\.text).joined()
+            let rawCombined = sortedLines.map(\.text).joined()
+            let combinedText = cleanVerticalOCRArtifacts(rawCombined)
             guard !combinedText.isEmpty else { continue }
 
             let allCorners = cluster.flatMap(\.corners)
@@ -438,6 +439,45 @@ struct VisionKitMangaOCRService: OCRRecognizing {
         }
     }
 
+    /// Detects whether `line` is a furigana ruby gloss sitting alongside a Kanji column
+    /// (such as `あした` next to `明日`, `うんめい` next to `運命`, or `げんち` next to `言質`).
+    private static func isFuriganaGloss(
+        _ line: RawLine,
+        kanjiLines: [RawLine],
+        maxColThickness: CGFloat
+    ) -> Bool {
+        guard isPureHiragana(line.text), line.text.count <= 5 else { return false }
+        let thickness = min(line.mask.width, line.mask.height)
+
+        // 1. Clearly thinner than the main column thickness
+        guard thickness < maxColThickness * 0.68 else { return false }
+
+        // 2. Check if it sits immediately alongside a Kanji column with vertical overlap
+        for kLine in kanjiLines {
+            let kThickness = min(kLine.mask.width, kLine.mask.height)
+            guard thickness < kThickness * 0.78 else { continue }
+
+            let horizGap = max(0, max(line.box.minX, kLine.box.minX) - min(line.box.maxX, kLine.box.maxX))
+            let vertOverlap = min(line.box.maxY, kLine.box.maxY) - max(line.box.minY, kLine.box.minY)
+
+            if horizGap < kThickness * 0.95 && vertOverlap > line.box.height * 0.45 {
+                return true
+            }
+        }
+
+        return false
+    }
+
+    private static func containsKanji(_ text: String) -> Bool {
+        for scalar in text.unicodeScalars {
+            let v = scalar.value
+            if (0x4E00...0x9FFF).contains(v) || (0x3400...0x4DBF).contains(v) {
+                return true
+            }
+        }
+        return false
+    }
+
     private static func isPureHiragana(_ text: String) -> Bool {
         guard !text.isEmpty else { return false }
         for scalar in text.unicodeScalars {
@@ -446,6 +486,29 @@ struct VisionKitMangaOCRService: OCRRecognizing {
             }
         }
         return true
+    }
+
+    /// Fixes common vertical Japanese OCR artifacts (such as vertical chōonpu `ー` misread as kanji `一`
+    /// between kana characters, e.g., `なんでもな一い` -> `なんでもなーい`).
+    private static func cleanVerticalOCRArtifacts(_ text: String) -> String {
+        let chars = Array(text)
+        guard chars.count >= 2 else { return text }
+        var out = chars
+
+        for i in 0..<out.count where out[i] == "一" {
+            let prevIsKana = i > 0 && isKana(out[i - 1])
+            let nextIsKana = (i + 1 < out.count) && isKana(out[i + 1])
+            if prevIsKana && (nextIsKana || i == out.count - 1) {
+                out[i] = "ー"
+            }
+        }
+        return String(out)
+    }
+
+    private static func isKana(_ ch: Character) -> Bool {
+        guard let scalar = ch.unicodeScalars.first else { return false }
+        let v = scalar.value
+        return (0x3040...0x309F).contains(v) || (0x30A0...0x30FF).contains(v)
     }
 
     private static func shouldMergeClusters(
@@ -519,7 +582,7 @@ struct VisionKitMangaOCRService: OCRRecognizing {
         let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
         try handler.perform([request])
 
-        let text = lines.joined(separator: " ")
+        let text = cleanVerticalOCRArtifacts(lines.joined(separator: " "))
         guard !text.isEmpty else { return [] }
         let box = CGRect(x: 0.1, y: 0.1, width: 0.8, height: 0.8)
         return [

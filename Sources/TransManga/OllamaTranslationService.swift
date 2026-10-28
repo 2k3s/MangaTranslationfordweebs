@@ -19,6 +19,8 @@ struct OllamaTranslationService: MangaTranslating {
         }
         struct Options: Encodable {
             let temperature: Double
+            let top_p: Double
+            let repeat_penalty: Double
         }
         let model: String
         let messages: [Message]
@@ -84,7 +86,7 @@ struct OllamaTranslationService: MangaTranslating {
             let terms = activeGlossary
                 .map { "- \($0.japanese) = \($0.english)" }
                 .joined(separator: "\n")
-            glossaryInstruction = "\nAlways use these exact character/term translations when they appear:\n\(terms)\n"
+            glossaryInstruction = "\nMANDATORY GLOSSARY TERMS:\n\(terms)\n"
         }
 
         var contextInstruction = ""
@@ -94,18 +96,26 @@ struct OllamaTranslationService: MangaTranslating {
                 .map { "- \($0.japanese) -> \($0.english)" }
                 .joined(separator: "\n")
             contextInstruction = """
-            \nPrevious scene dialogue context (use ONLY for pronoun, speaker, and story continuity — do NOT re-output these):
+            \nPREVIOUS SCENE DIALOGUE (for speaker/pronoun continuity ONLY — do NOT re-output these):
             \(historyLines)
             """
         }
 
         let systemPrompt = """
-        You are a professional Japanese-to-English manga localization translator.
-        Translate each numbered Japanese manga speech bubble into natural, concise English dialogue that fits inside a comic speech bubble.
-        STRICT RULES:
-        - Output strictly in English using the Latin alphabet ONLY.
-        - NEVER output any Chinese (Hanzi) or Japanese (Kanji, Hiragana, Katakana) characters under any circumstances.
-        - Keep the exact [1], [2], ... numbering on separate lines, with no extra commentary or notes.\(glossaryInstruction)\(contextInstruction)
+        You are an expert Japanese-to-English manga localizer (like Viz Media or Kodansha).
+        The numbered lines below are consecutive speech bubbles from the same manga page in reading order.
+        Read all lines together as a single conversation before translating each line.
+
+        LOCALIZATION GUIDELINES:
+        1. Write natural, idiomatic, spoken English that sounds like real people talking in a manga—never stiff, overly literal dictionary definitions.
+           - Example: "言質も取ったし" -> "Nice, I got his promise too!" (NOT "I got the collateral").
+           - Example: "ではまた明日" -> "Well then, see you tomorrow!" (NOT "Bright day").
+           - Example: "フフフ…" / "ふふ" -> "Heheh..." (never transliterate laughter as "Fufufu" or "Faf").
+           - Example: "なんでもなーい" -> "It's nothing at all~"
+        2. Infer omitted Japanese pronouns (I, you, he, she, we) from the surrounding bubbles on the page.
+        3. Keep each line concise enough to fit comfortably inside a speech bubble.
+        4. Output strictly in English using the Latin alphabet ONLY. NEVER output any Chinese (Hanzi) or Japanese characters.
+        5. Return ONLY the numbered lines [1], [2], ... on separate lines with zero extra commentary.\(glossaryInstruction)\(contextInstruction)
         """
 
         let payload = ChatRequest(
@@ -116,14 +126,14 @@ struct OllamaTranslationService: MangaTranslating {
             ],
             stream: false,
             keep_alive: "30m",
-            options: .init(temperature: 0.1)
+            options: .init(temperature: 0.15, top_p: 0.85, repeat_penalty: 1.08)
         )
 
         do {
             var request = URLRequest(url: url)
             request.httpMethod = "POST"
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            request.timeoutInterval = 30
+            request.timeoutInterval = 35
             request.httpBody = try JSONEncoder().encode(payload)
 
             let (data, response) = try await URLSession.shared.data(for: request)
@@ -151,7 +161,7 @@ struct OllamaTranslationService: MangaTranslating {
         You are a concise Japanese manga tutor.
         Break down the user's Japanese manga line word-by-word in 2 to 5 short bullet points.
         Format each bullet as:
-        • Word (Hiragana / Romaji) — English meaning
+        • Word (Hiragana / Romaji) — English meaning & nuance in context
         Keep it brief, accurate, and easy to scan.
         """
 
@@ -163,7 +173,7 @@ struct OllamaTranslationService: MangaTranslating {
             ],
             stream: false,
             keep_alive: "30m",
-            options: .init(temperature: 0.1)
+            options: .init(temperature: 0.1, top_p: 0.85, repeat_penalty: 1.05)
         )
 
         do {
