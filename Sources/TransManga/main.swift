@@ -1,22 +1,16 @@
 import SwiftUI
 import AppKit
-import Carbon.HIToolbox
+import Carbon
 
-@main
-struct TransManga: App {
-    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
-
-    var body: some Scene {
-        WindowGroup {
-            ContentView()
-                .frame(minWidth: 640, minHeight: 540)
-        }
-        .windowResizability(.contentSize)
-    }
+extension Notification.Name {
+    static let transMangaTranslate = Notification.Name("transMangaTranslate")
+    static let transMangaToggleClickThrough = Notification.Name("transMangaToggleClickThrough")
+    static let transMangaToggleAutoWatch = Notification.Name("transMangaToggleAutoWatch")
+    static let transMangaToggleCards = Notification.Name("transMangaToggleCards")
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    private var hotKeyRef: EventHotKeyRef?
+    private var translateHotKeyRef: EventHotKeyRef?
     private var clickThroughHotKeyRef: EventHotKeyRef?
     private var autoWatchHotKeyRef: EventHotKeyRef?
     private var peekCardsHotKeyRef: EventHotKeyRef?
@@ -26,26 +20,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
-        
-        if let icon = NSImage(named: "AppIcon")
-                 ?? NSImage(contentsOfFile: "AppIcon.png") {
-                 NSApp.applicationIconImage = icon
-             }
-        
-        if !CGPreflightScreenCaptureAccess() {
-            CGRequestScreenCaptureAccess()
+
+        if let iconURL = Bundle.main.url(forResource: "AppIcon", withExtension: "icns")
+            ?? Bundle.main.url(forResource: "AppIcon", withExtension: "png"),
+           let iconImage = NSImage(contentsOf: iconURL) {
+            NSApp.applicationIconImage = iconImage
         }
 
         registerGlobalHotKey()
-        overlayController.show()
-
-        NotificationCenter.default.addObserver(
-            forName: .transMangaToggleClickThrough,
-            object: nil,
-            queue: .main
-        ) { [weak self] _ in
-            self?.overlayController.toggleClickThrough()
-        }
+        overlayController.showOverlay()
     }
 
     private func registerGlobalHotKey() {
@@ -54,136 +37,74 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             eventKind: UInt32(kEventHotKeyPressed)
         )
 
-        let installStatus = InstallEventHandler(
-            GetApplicationEventTarget(),
-            { _, event, _ -> OSStatus in
-                var hotKeyID = EventHotKeyID()
-                let status = GetEventParameter(
-                    event,
-                    EventParamName(kEventParamDirectObject),
-                    EventParamType(typeEventHotKeyID),
-                    nil,
-                    MemoryLayout<EventHotKeyID>.size,
-                    nil,
-                    &hotKeyID
-                )
+        let handler: EventHandlerUPP = { _, event, _ -> OSStatus in
+            guard let event = event else { return noErr }
+            var hotKeyID = EventHotKeyID()
+            let status = GetEventParameter(
+                event,
+                EventParamName(kEventParamDirectObject),
+                EventParamType(typeEventHotKeyID),
+                nil,
+                MemoryLayout<EventHotKeyID>.size,
+                nil,
+                &hotKeyID
+            )
+            guard status == noErr else { return status }
 
-                guard status == noErr else { return status }
-
-                DispatchQueue.main.async {
-                    switch hotKeyID.id {
-                    case 1:
-                        NotificationCenter.default.post(
-                            name: .transMangaTranslate,
-                            object: nil
-                        )
-                    case 2:
-                        NotificationCenter.default.post(
-                            name: .transMangaToggleClickThrough,
-                            object: nil
-                        )
-                    case 3:
-                        NotificationCenter.default.post(
-                            name: .transMangaToggleAutoWatch,
-                            object: nil
-                        )
-                    case 4:
-                        NotificationCenter.default.post(
-                            name: .transMangaToggleCards,
-                            object: nil
-                        )
-                    default:
-                        break
-                    }
+            DispatchQueue.main.async {
+                switch hotKeyID.id {
+                case 1:
+                    NotificationCenter.default.post(name: .transMangaTranslate, object: nil)
+                case 2:
+                    NotificationCenter.default.post(name: .transMangaToggleClickThrough, object: nil)
+                case 3:
+                    NotificationCenter.default.post(name: .transMangaToggleAutoWatch, object: nil)
+                case 4:
+                    NotificationCenter.default.post(name: .transMangaToggleCards, object: nil)
+                default:
+                    break
                 }
+            }
+            return noErr
+        }
 
-                return noErr
-            },
+        InstallEventHandler(
+            GetApplicationEventTarget(),
+            handler,
             1,
             &eventType,
             nil,
             &eventHandlerRef
         )
 
-        guard installStatus == noErr else {
-            print("Failed to install hotkey handler: \(installStatus)")
-            return
-        }
+        let modifiers = UInt32(controlKey | optionKey)
 
-        let signature = OSType(0x4D544657)
+        // ⌃⌥M -> Translate Now (id: 1)
+        let translateID = EventHotKeyID(signature: OSType(0x544D4731), id: 1)
+        RegisterEventHotKey(UInt32(kVK_ANSI_M), modifiers, translateID, GetApplicationEventTarget(), 0, &translateHotKeyRef)
 
-        let translateID = EventHotKeyID(signature: signature, id: 1)
-        let translateStatus = RegisterEventHotKey(
-            UInt32(kVK_ANSI_M),
-            UInt32(controlKey | optionKey),
-            translateID,
-            GetApplicationEventTarget(),
-            0,
-            &hotKeyRef
-        )
+        // ⌃⌥O -> Toggle Click-Through / Reading Mode (id: 2)
+        let clickThroughID = EventHotKeyID(signature: OSType(0x544D4732), id: 2)
+        RegisterEventHotKey(UInt32(kVK_ANSI_O), modifiers, clickThroughID, GetApplicationEventTarget(), 0, &clickThroughHotKeyRef)
 
-        let clickThroughID = EventHotKeyID(signature: signature, id: 2)
-        let clickThroughStatus = RegisterEventHotKey(
-            UInt32(kVK_ANSI_O),
-            UInt32(controlKey | optionKey),
-            clickThroughID,
-            GetApplicationEventTarget(),
-            0,
-            &clickThroughHotKeyRef
-        )
+        // ⌃⌥W -> Toggle Auto-Watch (id: 3)
+        let autoWatchID = EventHotKeyID(signature: OSType(0x544D4733), id: 3)
+        RegisterEventHotKey(UInt32(kVK_ANSI_W), modifiers, autoWatchID, GetApplicationEventTarget(), 0, &autoWatchHotKeyRef)
 
-        let autoWatchID = EventHotKeyID(signature: signature, id: 3)
-        let autoWatchStatus = RegisterEventHotKey(
-            UInt32(kVK_ANSI_W),
-            UInt32(controlKey | optionKey),
-            autoWatchID,
-            GetApplicationEventTarget(),
-            0,
-            &autoWatchHotKeyRef
-        )
-
-        let peekCardsID = EventHotKeyID(signature: signature, id: 4)
-        let peekCardsStatus = RegisterEventHotKey(
-            UInt32(kVK_ANSI_H),
-            UInt32(controlKey | optionKey),
-            peekCardsID,
-            GetApplicationEventTarget(),
-            0,
-            &peekCardsHotKeyRef
-        )
-
-        print("M hotkey status: \(translateStatus)")
-        print("O hotkey status: \(clickThroughStatus)")
-        print("W hotkey status: \(autoWatchStatus)")
-        print("H hotkey status: \(peekCardsStatus)")
-    }
-
-    func applicationWillTerminate(_ notification: Notification) {
-        if let hotKeyRef {
-            UnregisterEventHotKey(hotKeyRef)
-        }
-        if let clickThroughHotKeyRef {
-            UnregisterEventHotKey(clickThroughHotKeyRef)
-        }
-        if let autoWatchHotKeyRef {
-            UnregisterEventHotKey(autoWatchHotKeyRef)
-        }
-        if let peekCardsHotKeyRef {
-            UnregisterEventHotKey(peekCardsHotKeyRef)
-        }
-        if let eventHandlerRef {
-            RemoveEventHandler(eventHandlerRef)
-        }
+        // ⌃⌥H -> Peek Original / Hide Cards (id: 4)
+        let peekID = EventHotKeyID(signature: OSType(0x544D4734), id: 4)
+        RegisterEventHotKey(UInt32(kVK_ANSI_H), modifiers, peekID, GetApplicationEventTarget(), 0, &peekCardsHotKeyRef)
     }
 }
 
-extension Notification.Name {
-    static let transMangaTranslate =
-        Notification.Name("TransMangaTranslate")
-    static let transMangaToggleClickThrough =
-        Notification.Name("TransMangaToggleClickThrough")
-    static let transMangaToggleAutoWatch =
-        Notification.Name("TransMangaToggleAutoWatch")
-    static let transMangaToggleCards =
-        Notification.Name("TransMangaToggleCards")
+@main
+struct TransMangaApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
+
+    var body: some Scene {
+        WindowGroup("TransManga") {
+            ContentView()
+        }
+        .windowStyle(.hiddenTitleBar)
+    }
 }

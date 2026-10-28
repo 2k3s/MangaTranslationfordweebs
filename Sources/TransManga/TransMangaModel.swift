@@ -1,662 +1,603 @@
+import Foundation
 import AppKit
-@preconcurrency import Vision
+import Vision
 import VisionKit
-import ImageIO
+import CoreGraphics
+import SwiftUI
 
-@MainActor
-final class TransMangaModel: ObservableObject {
-    @Published var recognizedText = ""
-    @Published var translatedText = ""
-    @Published var error: String? {
-        didSet {
-            OverlaySelectionStore.shared.statusError = error
-        }
-    }
-    @Published var isWorking = false {
-        didSet {
-            OverlaySelectionStore.shared.isWorking = isWorking
-        }
-    }
-    @Published var isAutoWatching = true {
-        didSet {
-            OverlaySelectionStore.shared.isAutoWatching = isAutoWatching
-        }
-    }
-
-    private var watchTask: Task<Void, Never>?
-    private var captureTask: Task<Void, Never>?
-    private var lastTranslatedFingerprint: [UInt8]?
-    private var lastTranslatedSelectionRect: CGRect?
-
-    init() {
-        OverlaySelectionStore.shared.isAutoWatching = isAutoWatching
-        print("Auto-Watch: enabled (monitoring selection for page changes)")
-        startWatching()
-    }
-
-    func reset() {
-        captureTask?.cancel()
-        recognizedText = ""
-        translatedText = ""
-        error = nil
-        lastTranslatedFingerprint = nil
-        OverlaySelectionStore.shared.translationBoxes = []
-    }
-
-    func clearTranslationCache() {
-        LocalTranslator.clearCache()
-    }
-
-    func toggleAutoWatch() {
-        isAutoWatching.toggle()
-        if isAutoWatching {
-            print("Auto-Watch: enabled")
-            startWatching()
-        } else {
-            print("Auto-Watch: disabled")
-            watchTask?.cancel()
-            watchTask = nil
-        }
-    }
-
-    func captureAndRecognize() async {
-        captureTask?.cancel()
-        let task = Task { [weak self] in
-            guard let self else { return }
-            do {
-                let image = try ScreenCapture.captureSelectedRegion()
-                let fp = ScreenCapture.fingerprint(of: image)
-                self.lastTranslatedFingerprint = fp
-                self.lastTranslatedSelectionRect = OverlaySelectionStore.shared.normalizedRect
-                await self.processCapturedImage(image)
-            } catch {
-                self.error = error.localizedDescription
-            }
-        }
-        captureTask = task
-        await task.value
-    }
-
-    private func startWatching() {
-        watchTask?.cancel()
-        watchTask = Task { [weak self] in
-            guard let self else { return }
-            var previousTickFP: [UInt8]?
-            var isWaitingToSettle = false
-
-            while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 350_000_000) // 0.35s tick
-                guard !Task.isCancelled, self.isAutoWatching else { break }
-
-                guard let image = try? ScreenCapture.captureSelectedRegion() else {
-                    continue
-                }
-
-                let currentFP = ScreenCapture.fingerprint(of: image)
-                let currentRect = OverlaySelectionStore.shared.normalizedRect
-
-                if let lastFP = self.lastTranslatedFingerprint {
-                    let pageChanged = ScreenCapture.hasPageChanged(currentFP, lastFP)
-                    let rectChanged = (self.lastTranslatedSelectionRect != currentRect)
-
-                    if pageChanged || rectChanged {
-                        if !OverlaySelectionStore.shared.translationBoxes.isEmpty {
-                            OverlaySelectionStore.shared.translationBoxes = []
-                            print("Auto-Watch: page change detected, hiding overlay cards")
-                        }
-                        self.captureTask?.cancel()
-                        isWaitingToSettle = true
-                    }
-                }
-
-                if isWaitingToSettle, let prevFP = previousTickFP {
-                    if ScreenCapture.hasPageSettled(currentFP, prevFP) {
-                        isWaitingToSettle = false
-                        self.lastTranslatedFingerprint = currentFP
-                        self.lastTranslatedSelectionRect = currentRect
-
-                        print("Auto-Watch: page settled, running OCR & translation")
-                        self.captureTask?.cancel()
-                        self.captureTask = Task { [weak self] in
-                            await self?.processCapturedImage(image)
-                        }
-                    }
-                }
-
-                previousTickFP = currentFP
-            }
-        }
-    }
-
-    private func processCapturedImage(_ image: CGImage) async {
-        isWorking = true
-        error = nil
-        defer { isWorking = false }
-
-        do {
-            let regions = try await JapaneseOCR.recognizeRegions(in: image)
-            try Task.checkCancellation()
-
-            if regions.isEmpty {
-                recognizedText = "No Japanese text was detected. Try zooming in or capturing a page with larger text."
-                translatedText = ""
-                OverlaySelectionStore.shared.translationBoxes = []
-                return
-            }
-
-            recognizedText = regions.map(\.japaneseText).joined(separator: "\n\n")
-
-            let englishBlocks = try await LocalTranslator.translateRegions(
-                regions.map(\.japaneseText)
-            )
-            try Task.checkCancellation()
-
-            translatedText = englishBlocks.joined(separator: "\n\n")
-            OverlaySelectionStore.shared.areCardsHidden = false
-
-            OverlaySelectionStore.shared.translationBoxes = zip(regions, englishBlocks).map { region, english in
-                OverlayTranslationBox(
-                    normalizedRect: region.normalizedRect,
-                    text: english
-                )
-            }
-        } catch is CancellationError {
-            // Cancelled by a newer page turn or scroll; ignore quietly.
-        } catch {
-            self.error = error.localizedDescription
-        }
-    }
+struct RecognizedBlock: Identifiable {
+    let id = UUID()
+    let index: Int
+    let japaneseText: String
+    var englishText: String
+    /// Normalized 0...1 top-left bounding box within the captured image
+    let boundingBox: CGRect
+    /// Oriented center & dimensions in normalized 0...1 coordinates
+    let centerX: CGFloat
+    let centerY: CGFloat
+    let orientedWidth: CGFloat
+    let orientedHeight: CGFloat
+    let rotationRadians: Double
+    /// Individual oriented line masks (including furigana) so all original ink is covered
+    var lineMasks: [OrientedLineMask]
 }
 
-enum ScreenCaptureError: LocalizedError {
-    case noDisplayImage
-
-    var errorDescription: String? {
-        switch self {
-        case .noDisplayImage:
-            return "Couldn't capture the display. Grant Screen Recording permission in System Settings → Privacy & Security."
-        }
-    }
+struct GlossaryEntry: Identifiable, Codable, Equatable {
+    var id = UUID()
+    var japanese: String
+    var english: String
 }
 
 enum ScreenCapture {
-    static func captureSelectedRegion() throws -> CGImage {
-        guard let screen = NSScreen.main,
-              let windowID = OverlaySelectionStore.shared.overlayWindowID else {
-            throw ScreenCaptureError.noDisplayImage
-        }
-
-        let selection = OverlaySelectionStore.shared.normalizedRect
-        let screenFrame = screen.frame
-        let primaryScreenHeight = NSScreen.screens.first?.frame.height ?? screenFrame.height
-        let screenTopY = primaryScreenHeight - screenFrame.maxY
-
-        let captureRect = CGRect(
-            x: screenFrame.minX + selection.minX * screenFrame.width,
-            y: screenTopY + selection.minY * screenFrame.height,
-            width: selection.width * screenFrame.width,
-            height: selection.height * screenFrame.height
+    static func captureRegion(_ rect: CGRect) -> CGImage? {
+        CGWindowListCreateImage(
+            rect,
+            .optionOnScreenOnly,
+            kCGNullWindowID,
+            [.boundsIgnoreFraming, .bestResolution]
         )
-
-        guard let image = CGWindowListCreateImage(
-            captureRect,
-            .optionOnScreenBelowWindow,
-            windowID,
-            [.bestResolution, .boundsIgnoreFraming]
-        ) else {
-            throw ScreenCaptureError.noDisplayImage
-        }
-
-        return image
-    }
-
-    static func fingerprint(of image: CGImage) -> [UInt8] {
-        let size = 32
-        var pixels = [UInt8](repeating: 0, count: size * size)
-        let colorSpace = CGColorSpaceCreateDeviceGray()
-
-        guard let context = CGContext(
-            data: &pixels,
-            width: size,
-            height: size,
-            bitsPerComponent: 8,
-            bytesPerRow: size,
-            space: colorSpace,
-            bitmapInfo: CGImageAlphaInfo.none.rawValue
-        ) else {
-            return pixels
-        }
-
-        context.interpolationQuality = .medium
-        context.draw(image, in: CGRect(x: 0, y: 0, width: size, height: size))
-        return pixels
-    }
-
-    static func hasPageChanged(_ a: [UInt8], _ b: [UInt8]) -> Bool {
-        guard a.count == b.count, !a.isEmpty else { return true }
-        var totalDiff = 0
-        var changedCells = 0
-
-        for i in 0..<a.count {
-            let diff = abs(Int(a[i]) - Int(b[i]))
-            totalDiff += diff
-            if diff >= 18 {
-                changedCells += 1
-            }
-        }
-
-        let meanDiff = Double(totalDiff) / Double(a.count)
-        return meanDiff >= 2.5 || changedCells >= 28
-    }
-
-    static func hasPageSettled(_ a: [UInt8], _ b: [UInt8]) -> Bool {
-        guard a.count == b.count, !a.isEmpty else { return false }
-        var totalDiff = 0
-        var changedCells = 0
-
-        for i in 0..<a.count {
-            let diff = abs(Int(a[i]) - Int(b[i]))
-            totalDiff += diff
-            if diff >= 12 {
-                changedCells += 1
-            }
-        }
-
-        let meanDiff = Double(totalDiff) / Double(a.count)
-        return meanDiff < 1.0 && changedCells <= 6
     }
 }
 
-struct RecognizedBubbleRegion {
-    let normalizedRect: CGRect
-    let japaneseText: String
-}
-
-enum JapaneseOCR {
-    private static let sharedAnalyzer = ImageAnalyzer()
-
-    private struct RecognizedLine {
+enum MangaOCR {
+    private struct RawLine {
         let text: String
-        // Normalized 0...1 top-left coordinates in the full captured image.
-        let rect: CGRect
+        let box: CGRect
+        let corners: [CGPoint]
+        let rotationRadians: Double
+        let mask: OrientedLineMask
     }
 
-    static func recognizeRegions(in image: CGImage) async throws -> [RecognizedBubbleRegion] {
+    static func recognizeBubbleClusters(from cgImage: CGImage) async throws -> [RecognizedBlock] {
         guard ImageAnalyzer.isSupported else {
-            return []
+            return try recognizeHorizontalFallback(from: cgImage)
         }
 
+        let analyzer = ImageAnalyzer()
         var configuration = ImageAnalyzer.Configuration([.text])
-        configuration.locales = ["ja-JP"]
+        configuration.locales = ["ja-JP", "ja", "en-US"]
 
-        let imageW = CGFloat(image.width)
-        let imageH = CGFloat(image.height)
-        let panelStrips = detectHorizontalPanelRects(in: image)
-        print("Analyzing \(panelStrips.count) horizontal strip(s) (\(image.width)×\(image.height))")
+        let nsImage = NSImage(
+            cgImage: cgImage,
+            size: NSSize(width: cgImage.width, height: cgImage.height)
+        )
+        let analysis = try await analyzer.analyze(nsImage, orientation: .up, configuration: configuration)
 
-        var allLines: [RecognizedLine] = []
-
-        for stripRect in panelStrips {
-            try Task.checkCancellation()
-            guard let croppedImage = image.cropping(to: stripRect) else {
-                continue
+        let rawLines = extractRecognizedLines(
+            from: analysis,
+            imageWidth: CGFloat(cgImage.width),
+            imageHeight: CGFloat(cgImage.height)
+        )
+        if !rawLines.isEmpty {
+            let panelRects = detectHorizontalPanelRects(in: cgImage)
+            let clusters = groupLinesIntoSpeechBubbles(
+                rawLines,
+                panelRects: panelRects,
+                imageWidth: CGFloat(cgImage.width),
+                imageHeight: CGFloat(cgImage.height)
+            )
+            if !clusters.isEmpty {
+                return clusters
             }
-
-            let analysis = try await sharedAnalyzer.analyze(
-                croppedImage,
-                orientation: .up,
-                configuration: configuration
-            )
-
-            let stripLines = extractRecognizedLines(
-                from: analysis,
-                in: stripRect,
-                imageWidth: imageW,
-                imageHeight: imageH
-            )
-            allLines.append(contentsOf: stripLines)
         }
 
-        if allLines.isEmpty && panelStrips.count > 1 {
-            try Task.checkCancellation()
-            let fullRect = CGRect(x: 0, y: 0, width: imageW, height: imageH)
-            let fullAnalysis = try await sharedAnalyzer.analyze(
-                image,
-                orientation: .up,
-                configuration: configuration
+        let fullTranscript = analysis.transcript
+            .components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+
+        guard !fullTranscript.isEmpty else { return [] }
+        let fallbackBox = CGRect(x: 0.1, y: 0.1, width: 0.8, height: 0.8)
+        return [
+            RecognizedBlock(
+                index: 1,
+                japaneseText: fullTranscript,
+                englishText: "Translating...",
+                boundingBox: fallbackBox,
+                centerX: 0.5,
+                centerY: 0.5,
+                orientedWidth: 0.8,
+                orientedHeight: 0.8,
+                rotationRadians: 0,
+                lineMasks: [
+                    OrientedLineMask(
+                        centerX: 0.5,
+                        centerY: 0.5,
+                        width: 0.8,
+                        height: 0.8,
+                        rotationRadians: 0,
+                        sampleBox: fallbackBox
+                    )
+                ]
             )
-            allLines = extractRecognizedLines(
-                from: fullAnalysis,
-                in: fullRect,
-                imageWidth: imageW,
-                imageHeight: imageH
-            )
-        }
-
-        let bubbles = groupLinesIntoSpeechBubbles(allLines)
-        print("Grouped \(allLines.count) line(s) into \(bubbles.count) speech bubble(s)")
-
-        for (index, bubble) in bubbles.enumerated() {
-            print("Bubble \(index + 1): \(bubble.japaneseText.replacingOccurrences(of: "\n", with: " / "))")
-        }
-
-        return bubbles
+        ]
     }
 
     private static func extractRecognizedLines(
         from analysis: ImageAnalysis,
-        in cropRect: CGRect,
         imageWidth: CGFloat,
         imageHeight: CGFloat
-    ) -> [RecognizedLine] {
-        var extracted: [RecognizedLine] = []
+    ) -> [RawLine] {
+        var results: [RawLine] = []
+        let mirror = Mirror(reflecting: analysis)
 
-        for child in Mirror(reflecting: analysis).children {
+        for child in mirror.children {
             guard let vkAnalysis = child.value as? NSObject,
                   vkAnalysis.responds(to: NSSelectorFromString("allLines")),
-                  let lines = vkAnalysis.value(forKey: "allLines") as? [NSObject] else {
+                  let allLines = vkAnalysis.value(forKey: "allLines") as? [NSObject] else {
                 continue
             }
 
-            for line in lines {
-                guard let rawText = line.value(forKey: "string") as? String else {
+            for line in allLines {
+                guard line.responds(to: NSSelectorFromString("string")),
+                      let text = line.value(forKey: "string") as? String else {
                     continue
                 }
-                let cleaned = cleanTranscript(rawText)
-                guard !cleaned.isEmpty,
-                      let quad = line.value(forKey: "quad") as? NSObject,
-                      let bboxValue = quad.value(forKey: "boundingBox") as? NSValue else {
-                    continue
+                let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmed.isEmpty else { continue }
+
+                if line.responds(to: NSSelectorFromString("quad")),
+                   let quad = line.value(forKey: "quad") as? NSObject,
+                   quad.responds(to: NSSelectorFromString("boundingBox")),
+                   let rectVal = quad.value(forKey: "boundingBox") as? NSValue {
+                    let rect = rectVal.rectValue
+                    guard rect.width > 0.004, rect.height > 0.004 else { continue }
+
+                    let corners = extractQuadCorners(from: quad, fallbackRect: rect)
+                    let angle = computeSlantAngleRadians(
+                        corners: corners,
+                        imageWidth: imageWidth,
+                        imageHeight: imageHeight
+                    )
+                    let mask = computeOrientedMask(
+                        corners: corners,
+                        angle: angle,
+                        sampleBox: rect,
+                        imageWidth: imageWidth,
+                        imageHeight: imageHeight
+                    )
+
+                    results.append(
+                        RawLine(
+                            text: trimmed,
+                            box: rect,
+                            corners: corners,
+                            rotationRadians: angle,
+                            mask: mask
+                        )
+                    )
                 }
-
-                let localBox = bboxValue.rectValue
-                let globalBox = CGRect(
-                    x: (cropRect.minX + localBox.minX * cropRect.width) / imageWidth,
-                    y: (cropRect.minY + localBox.minY * cropRect.height) / imageHeight,
-                    width: (localBox.width * cropRect.width) / imageWidth,
-                    height: (localBox.height * cropRect.height) / imageHeight
-                )
-
-                extracted.append(RecognizedLine(text: cleaned, rect: globalBox))
             }
         }
-
-        return extracted
+        return results
     }
 
-    private static func groupLinesIntoSpeechBubbles(
-        _ lines: [RecognizedLine]
-    ) -> [RecognizedBubbleRegion] {
-        guard !lines.isEmpty else { return [] }
-
-        var remaining = lines
-        var clusters: [[RecognizedLine]] = []
-
-        func linesBelongToSameBubble(_ a: CGRect, _ b: CGRect) -> Bool {
-            let aIsHorizontal = a.width > a.height * 1.3
-            let bIsHorizontal = b.width > b.height * 1.3
-            if aIsHorizontal != bIsHorizontal {
-                return false
+    private static func extractQuadCorners(from quad: NSObject, fallbackRect: CGRect) -> [CGPoint] {
+        let keys = ["topLeft", "topRight", "bottomRight", "bottomLeft"]
+        var pts: [CGPoint] = []
+        for key in keys {
+            if quad.responds(to: NSSelectorFromString(key)),
+               let val = quad.value(forKey: key) as? NSValue {
+                pts.append(val.pointValue)
             }
-
-            let horizontalGap = max(0, max(a.minX - b.maxX, b.minX - a.maxX))
-            let verticalGap = max(0, max(a.minY - b.maxY, b.minY - a.maxY))
-            let colWidth = min(0.035, min(a.width, b.width))
-
-            let verticalOverlap = min(a.maxY, b.maxY) - max(a.minY, b.minY)
-            if verticalOverlap > 0 && horizontalGap <= max(0.026, colWidth * 1.1) {
-                return true
-            }
-
-            return horizontalGap <= 0.018 && verticalGap <= 0.022
         }
-
-        while !remaining.isEmpty {
-            var cluster = [remaining.removeFirst()]
-            var index = 0
-
-            while index < cluster.count {
-                let current = cluster[index].rect
-                index += 1
-
-                var i = 0
-                while i < remaining.count {
-                    if linesBelongToSameBubble(current, remaining[i].rect) {
-                        cluster.append(remaining.remove(at: i))
-                    } else {
-                        i += 1
-                    }
-                }
-            }
-
-            clusters.append(cluster)
+        if pts.count == 4 {
+            return pts
         }
-
-        var regions: [RecognizedBubbleRegion] = clusters.compactMap { cluster in
-            let unionRect = cluster.dropFirst().reduce(cluster[0].rect) {
-                $0.union($1.rect)
-            }
-
-            // Filter out tiny furigana (ruby) columns alongside main kanji columns.
-            let maxColThickness = cluster
-                .map { min($0.rect.width, $0.rect.height) }
-                .max() ?? 0
-
-            let mainLines: [RecognizedLine]
-            if cluster.count >= 2 && maxColThickness > 0 {
-                let filtered = cluster.filter { line in
-                    let thickness = min(line.rect.width, line.rect.height)
-                    if isPureHiragana(line.text) && thickness < maxColThickness * 0.60 {
-                        return false
-                    }
-                    return true
-                }
-                mainLines = filtered.isEmpty ? cluster : filtered
-            } else {
-                mainLines = cluster
-            }
-
-            let sortedLines = mainLines.sorted { lhs, rhs in
-                let a = lhs.rect
-                let b = rhs.rect
-                let minW = min(a.width, b.width)
-
-                if abs(a.midX - b.midX) > max(0.012, minW * 0.5) {
-                    return a.midX > b.midX
-                }
-                return a.minY < b.minY
-            }
-
-            let paddedRect = unionRect
-                .insetBy(dx: -0.014, dy: -0.012)
-                .intersection(CGRect(x: 0, y: 0, width: 1, height: 1))
-
-            let text = sortedLines.map(\.text).joined(separator: "\n")
-            guard !text.isEmpty else { return nil }
-
-            return RecognizedBubbleRegion(
-                normalizedRect: paddedRect,
-                japaneseText: text
-            )
-        }
-
-        regions.sort { lhs, rhs in
-            let a = lhs.normalizedRect
-            let b = rhs.normalizedRect
-            let verticalOverlap = min(a.maxY, b.maxY) - max(a.minY, b.minY)
-            let minHeight = min(a.height, b.height)
-
-            if verticalOverlap > minHeight * 0.25 {
-                return a.midX > b.midX
-            }
-            return a.midY < b.midY
-        }
-
-        return regions
+        return [
+            CGPoint(x: fallbackRect.minX, y: fallbackRect.minY),
+            CGPoint(x: fallbackRect.maxX, y: fallbackRect.minY),
+            CGPoint(x: fallbackRect.maxX, y: fallbackRect.maxY),
+            CGPoint(x: fallbackRect.minX, y: fallbackRect.maxY)
+        ]
     }
 
-    private static func isPureHiragana(_ text: String) -> Bool {
-        var hasHiragana = false
-        for scalar in text.unicodeScalars {
-            switch scalar.value {
-            case 0x3040...0x309F: // Hiragana
-                hasHiragana = true
-            case 0x0020, 0x3000, 0x30FB, 0x30FC: // Spaces / middle dot / long vowel mark
-                continue
-            default:
-                return false
-            }
+    private static func computeSlantAngleRadians(
+        corners: [CGPoint],
+        imageWidth: CGFloat,
+        imageHeight: CGFloat
+    ) -> Double {
+        guard corners.count == 4 else { return 0 }
+        let p0 = CGPoint(x: corners[0].x * imageWidth, y: corners[0].y * imageHeight)
+        let p1 = CGPoint(x: corners[1].x * imageWidth, y: corners[1].y * imageHeight)
+        let p3 = CGPoint(x: corners[3].x * imageWidth, y: corners[3].y * imageHeight)
+
+        let dx1 = p1.x - p0.x
+        let dy1 = p1.y - p0.y
+        let len1 = hypot(dx1, dy1)
+
+        let dx2 = p3.x - p0.x
+        let dy2 = p3.y - p0.y
+        let len2 = hypot(dx2, dy2)
+
+        let rawAngle = len1 >= len2
+            ? atan2(Double(dy1), Double(dx1))
+            : atan2(Double(dy2), Double(dx2))
+
+        var folded = rawAngle
+        while folded > Double.pi / 4 { folded -= Double.pi / 2 }
+        while folded < -Double.pi / 4 { folded += Double.pi / 2 }
+
+        if abs(folded) < 0.044 {
+            return 0
         }
-        return hasHiragana
+        return folded
     }
 
-    private static func detectHorizontalPanelRects(in image: CGImage) -> [CGRect] {
-        let width = image.width
-        let height = image.height
-        let fullRect = CGRect(x: 0, y: 0, width: width, height: height)
+    private static func computeOrientedMask(
+        corners: [CGPoint],
+        angle: Double,
+        sampleBox: CGRect,
+        imageWidth: CGFloat,
+        imageHeight: CGFloat
+    ) -> OrientedLineMask {
+        let cosA = CGFloat(cos(angle))
+        let sinA = CGFloat(sin(angle))
 
-        guard width >= 64, height >= 64 else {
-            return [fullRect]
+        var minU = CGFloat.greatestFiniteMagnitude
+        var maxU = -CGFloat.greatestFiniteMagnitude
+        var minV = CGFloat.greatestFiniteMagnitude
+        var maxV = -CGFloat.greatestFiniteMagnitude
+
+        for pt in corners {
+            let px = pt.x * imageWidth
+            let py = pt.y * imageHeight
+            let u = px * cosA + py * sinA
+            let v = -px * sinA + py * cosA
+            minU = min(minU, u)
+            maxU = max(maxU, u)
+            minV = min(minV, v)
+            maxV = max(maxV, v)
         }
 
-        var pixels = [UInt8](repeating: 0, count: width * height)
-        let colorSpace = CGColorSpaceCreateDeviceGray()
+        let midU = (minU + maxU) * 0.5
+        let midV = (minV + maxV) * 0.5
+        let centerPxX = midU * cosA - midV * sinA
+        let centerPxY = midU * sinA + midV * cosA
+
+        let wPx = max(4, maxU - minU)
+        let hPx = max(4, maxV - minV)
+
+        return OrientedLineMask(
+            centerX: centerPxX / max(imageWidth, 1),
+            centerY: centerPxY / max(imageHeight, 1),
+            width: wPx / max(imageWidth, 1),
+            height: hPx / max(imageHeight, 1),
+            rotationRadians: angle,
+            sampleBox: sampleBox
+        )
+    }
+
+    private static func detectHorizontalPanelRects(in cgImage: CGImage) -> [CGRect] {
+        let width = cgImage.width
+        let height = cgImage.height
+        guard width > 40, height > 40 else {
+            return [CGRect(x: 0, y: 0, width: 1, height: 1)]
+        }
+
+        let sampleW = min(width, 240)
+        let sampleH = min(height, 360)
+        var pixels = [UInt8](repeating: 0, count: sampleW * sampleH)
 
         guard let context = CGContext(
             data: &pixels,
-            width: width,
-            height: height,
+            width: sampleW,
+            height: sampleH,
             bitsPerComponent: 8,
-            bytesPerRow: width,
-            space: colorSpace,
+            bytesPerRow: sampleW,
+            space: CGColorSpaceCreateDeviceGray(),
             bitmapInfo: CGImageAlphaInfo.none.rawValue
         ) else {
-            return [fullRect]
+            return [CGRect(x: 0, y: 0, width: 1, height: 1)]
         }
+        context.draw(cgImage, in: CGRect(x: 0, y: 0, width: sampleW, height: sampleH))
 
-        context.draw(image, in: fullRect)
+        let xStart = Int(Double(sampleW) * 0.05)
+        let xEnd = Int(Double(sampleW) * 0.95)
+        let span = max(1, xEnd - xStart)
 
-        let xStart = Int(Double(width) * 0.10)
-        let xEnd = max(xStart + 1, Int(Double(width) * 0.90))
-        let sampleWidth = xEnd - xStart
-        let gutterThresholdCount = Int(Double(sampleWidth) * 0.985)
-        let minGutterHeight = 6
-        let minPanelHeight = max(48, Int(Double(height) * 0.06))
-
-        var rawGutterRow = [Bool](repeating: false, count: height)
-        for y in 0..<height {
-            let rowOffset = y * width
+        var gutterRows = [Bool](repeating: false, count: sampleH)
+        for y in 0..<sampleH {
             var brightCount = 0
+            var darkCount = 0
+            let rowOffset = y * sampleW
             for x in xStart..<xEnd {
-                if pixels[rowOffset + x] >= 238 {
-                    brightCount += 1
-                }
+                let lum = pixels[rowOffset + x]
+                if lum >= 242 { brightCount += 1 }
+                if lum <= 25 { darkCount += 1 }
             }
-            if brightCount >= gutterThresholdCount {
-                rawGutterRow[y] = true
-            }
+            let brightRatio = Double(brightCount) / Double(span)
+            let darkRatio = Double(darkCount) / Double(span)
+            gutterRows[y] = (brightRatio > 0.93 || darkRatio > 0.93)
         }
 
-        var confirmedGutterRow = [Bool](repeating: false, count: height)
-        var gutterRunStart: Int?
-        for y in 0..<height {
-            if rawGutterRow[y] {
-                if gutterRunStart == nil { gutterRunStart = y }
-            } else if let start = gutterRunStart {
-                if y - start >= minGutterHeight {
-                    for gy in start..<y { confirmedGutterRow[gy] = true }
-                }
-                gutterRunStart = nil
-            }
-        }
-        if let start = gutterRunStart, height - start >= minGutterHeight {
-            for gy in start..<height { confirmedGutterRow[gy] = true }
-        }
+        var panelBands: [CGRect] = []
+        var bandStart: Int? = nil
+        let minBandHeight = max(4, Int(Double(sampleH) * 0.08))
 
-        var rowRects: [CGRect] = []
-        var bandStartY: Int?
-
-        for y in 0..<height {
-            if !confirmedGutterRow[y] {
-                if bandStartY == nil {
-                    bandStartY = y
-                }
-            } else if let startY = bandStartY {
-                let bandHeight = y - startY
-                if bandHeight >= minPanelHeight {
-                    rowRects.append(
-                        CGRect(x: 0, y: startY, width: width, height: bandHeight)
+        for y in 0..<sampleH {
+            if !gutterRows[y] {
+                if bandStart == nil { bandStart = y }
+            } else if let start = bandStart {
+                if y - start >= minBandHeight {
+                    panelBands.append(
+                        CGRect(
+                            x: 0.0,
+                            y: CGFloat(start) / CGFloat(sampleH),
+                            width: 1.0,
+                            height: CGFloat(y - start) / CGFloat(sampleH)
+                        )
                     )
                 }
-                bandStartY = nil
+                bandStart = nil
             }
         }
-
-        if let startY = bandStartY {
-            let bandHeight = height - startY
-            if bandHeight >= minPanelHeight {
-                rowRects.append(
-                    CGRect(x: 0, y: startY, width: width, height: bandHeight)
+        if let start = bandStart, sampleH - start >= minBandHeight {
+            panelBands.append(
+                CGRect(
+                    x: 0.0,
+                    y: CGFloat(start) / CGFloat(sampleH),
+                    width: 1.0,
+                    height: CGFloat(sampleH - start) / CGFloat(sampleH)
                 )
+            )
+        }
+
+        return panelBands.isEmpty ? [CGRect(x: 0, y: 0, width: 1, height: 1)] : panelBands
+    }
+
+    private static func groupLinesIntoSpeechBubbles(
+        _ lines: [RawLine],
+        panelRects: [CGRect],
+        imageWidth: CGFloat,
+        imageHeight: CGFloat
+    ) -> [RecognizedBlock] {
+        guard !lines.isEmpty else { return [] }
+
+        var clusters: [[RawLine]] = lines.map { [$0] }
+        var didMerge = true
+
+        while didMerge {
+            didMerge = false
+            outer: for i in 0..<clusters.count {
+                for j in (i + 1)..<clusters.count {
+                    if shouldMergeClusters(clusters[i], clusters[j], panelRects: panelRects) {
+                        clusters[i].append(contentsOf: clusters[j])
+                        clusters.remove(at: j)
+                        didMerge = true
+                        break outer
+                    }
+                }
             }
         }
 
-        return rowRects.isEmpty ? [fullRect] : rowRects
-    }
+        struct RawCluster {
+            let text: String
+            let box: CGRect
+            let centerX: CGFloat
+            let centerY: CGFloat
+            let orientedWidth: CGFloat
+            let orientedHeight: CGFloat
+            let rotationRadians: Double
+            let lineMasks: [OrientedLineMask]
+        }
 
-    private static func cleanTranscript(_ raw: String) -> String {
-        let lines = raw
-            .components(separatedBy: .newlines)
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { line in
-                guard !line.isEmpty else { return false }
-                return containsJapaneseCharacters(line)
+        var rawClusters: [RawCluster] = []
+        for cluster in clusters {
+            let unionBox = cluster.reduce(cluster[0].box) { $0.union($1.box) }
+
+            let maxColThickness = cluster.map { min($0.mask.width, $0.mask.height) }.max() ?? 0
+            let maxColLength = cluster.map { max($0.mask.width, $0.mask.height) }.max() ?? 0
+
+            // Only filter out a line from the OCR transcript if it is BOTH much thinner
+            // AND much shorter than the main dialogue column (true furigana ruby gloss),
+            // so full-height hiragana lines like "すみません" are never dropped!
+            let filteredLines: [RawLine]
+            if cluster.count > 1 {
+                let mainColumns = cluster.filter { line in
+                    let thickness = min(line.mask.width, line.mask.height)
+                    let length = max(line.mask.width, line.mask.height)
+                    let isTinyFurigana = thickness < maxColThickness * 0.52
+                        && length < maxColLength * 0.55
+                        && line.text.count <= 4
+                        && isPureHiragana(line.text)
+                    return !isTinyFurigana
+                }
+                filteredLines = mainColumns.isEmpty ? cluster : mainColumns
+            } else {
+                filteredLines = cluster
             }
-        return lines.joined(separator: "\n")
+
+            let avgAngle = filteredLines.map(\.rotationRadians).reduce(0.0, +) / Double(filteredLines.count)
+            let isHorizontalOrSlanted = filteredLines.contains { $0.mask.width > $0.mask.height * 1.35 }
+
+            let sortedLines: [RawLine]
+            if isHorizontalOrSlanted {
+                sortedLines = filteredLines.sorted { $0.box.midY < $1.box.midY }
+            } else {
+                sortedLines = filteredLines.sorted { a, b in
+                    if abs(a.box.midX - b.box.midX) > 0.015 {
+                        return a.box.midX > b.box.midX
+                    }
+                    return a.box.minY < b.box.minY
+                }
+            }
+
+            let combinedText = sortedLines.map(\.text).joined()
+            guard !combinedText.isEmpty else { continue }
+
+            // Use ALL corners in `cluster` (including furigana) so the oriented bounds
+            // and `lineMasks` completely cover every single original character & ruby gloss.
+            let allCorners = cluster.flatMap(\.corners)
+            let clusterMask = computeOrientedMask(
+                corners: allCorners,
+                angle: avgAngle,
+                sampleBox: unionBox,
+                imageWidth: imageWidth,
+                imageHeight: imageHeight
+            )
+
+            rawClusters.append(
+                RawCluster(
+                    text: combinedText,
+                    box: unionBox,
+                    centerX: clusterMask.centerX,
+                    centerY: clusterMask.centerY,
+                    orientedWidth: clusterMask.width,
+                    orientedHeight: clusterMask.height,
+                    rotationRadians: avgAngle,
+                    lineMasks: cluster.map(\.mask)
+                )
+            )
+        }
+
+        rawClusters.sort { a, b in
+            let verticalOverlap = min(a.box.maxY, b.box.maxY) - max(a.box.minY, b.box.minY)
+            let minH = min(a.box.height, b.box.height)
+            if verticalOverlap > minH * 0.25 {
+                return a.box.midX > b.box.minX
+            }
+            return a.box.minY < b.box.minY
+        }
+
+        return rawClusters.enumerated().map { idx, item in
+            RecognizedBlock(
+                index: idx + 1,
+                japaneseText: item.text,
+                englishText: "Translating...",
+                boundingBox: item.box,
+                centerX: item.centerX,
+                centerY: item.centerY,
+                orientedWidth: item.orientedWidth,
+                orientedHeight: item.orientedHeight,
+                rotationRadians: item.rotationRadians,
+                lineMasks: item.lineMasks
+            )
+        }
     }
 
-    private static func containsJapaneseCharacters(_ text: String) -> Bool {
+    private static func isPureHiragana(_ text: String) -> Bool {
+        guard !text.isEmpty else { return false }
         for scalar in text.unicodeScalars {
-            switch scalar.value {
-            case 0x3040...0x309F, // Hiragana
-                 0x30A0...0x30FF, // Katakana
-                 0x4E00...0x9FFF, // CJK Unified Ideographs (Kanji)
-                 0x3400...0x4DBF: // CJK Extension A
-                return true
-            default:
-                continue
+            if !(0x3040...0x309F).contains(scalar.value) {
+                return false
+            }
+        }
+        return true
+    }
+
+    private static func shouldMergeClusters(
+        _ c1: [RawLine],
+        _ c2: [RawLine],
+        panelRects: [CGRect]
+    ) -> Bool {
+        for a in c1 {
+            for b in c2 {
+                if areLinesInSameBubble(a, b, panelRects: panelRects) {
+                    return true
+                }
             }
         }
         return false
     }
-}
 
-enum TranslationError: LocalizedError {
-    case ollamaUnavailable
-    case serverError(Int, String)
-
-    var errorDescription: String? {
-        switch self {
-        case .ollamaUnavailable:
-            return "Couldn't connect to Ollama on 127.0.0.1:11434. Make sure 'ollama serve' is running."
-        case .serverError(let code, let body):
-            return "Ollama returned HTTP \(code): \(body)"
+    private static func areLinesInSameBubble(
+        _ a: RawLine,
+        _ b: RawLine,
+        panelRects: [CGRect]
+    ) -> Bool {
+        if let panelA = panelIndex(for: a.box, in: panelRects),
+           let panelB = panelIndex(for: b.box, in: panelRects),
+           panelA != panelB {
+            return false
         }
+
+        if abs(a.rotationRadians - b.rotationRadians) > 0.14 {
+            return false
+        }
+
+        let aIsHoriz = a.mask.width > a.mask.height * 1.25
+        let bIsHoriz = b.mask.width > b.mask.height * 1.25
+        if aIsHoriz && bIsHoriz {
+            let lineH = max(min(a.mask.height, b.mask.height), 0.012)
+            let verticalCenterDist = abs(a.mask.centerY - b.mask.centerY)
+            let horizOverlap = min(a.box.maxX, b.box.maxX) - max(a.box.minX, b.box.minX)
+            let minW = min(a.box.width, b.box.width)
+            return horizOverlap > minW * 0.35 && verticalCenterDist < lineH * 1.75
+        }
+
+        let colWidth = max(min(a.box.width, b.box.width), 0.014)
+        let horizontalGap = max(0, max(a.box.minX, b.box.minX) - min(a.box.maxX, b.box.maxX))
+
+        let verticalOverlap = min(a.box.maxY, b.box.maxY) - max(a.box.minY, b.box.minY)
+        let minHeight = min(a.box.height, b.box.height)
+
+        let topAlignmentDiff = abs(a.box.minY - b.box.minY)
+        let maxHeight = max(a.box.height, b.box.height)
+
+        let isVerticallyAligned = (verticalOverlap > minHeight * 0.35) || (topAlignmentDiff < maxHeight * 0.30)
+        let isHorizontallyAdjacent = horizontalGap < colWidth * 1.65
+
+        return isVerticallyAligned && isHorizontallyAdjacent
+    }
+
+    private static func panelIndex(for box: CGRect, in panels: [CGRect]) -> Int? {
+        let midY = box.midY
+        return panels.firstIndex { $0.minY <= midY && midY <= $0.maxY }
+    }
+
+    private static func recognizeHorizontalFallback(from cgImage: CGImage) throws -> [RecognizedBlock] {
+        var lines: [String] = []
+        let request = VNRecognizeTextRequest { req, _ in
+            guard let observations = req.results as? [VNRecognizedTextObservation] else { return }
+            lines = observations.compactMap { $0.topCandidates(1).first?.string }
+        }
+        request.recognitionLevel = .accurate
+        request.recognitionLanguages = ["ja-JP", "en-US"]
+        request.usesLanguageCorrection = true
+
+        let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+        try handler.perform([request])
+
+        let text = lines.joined(separator: " ")
+        guard !text.isEmpty else { return [] }
+        let box = CGRect(x: 0.1, y: 0.1, width: 0.8, height: 0.8)
+        return [
+            RecognizedBlock(
+                index: 1,
+                japaneseText: text,
+                englishText: "Translating...",
+                boundingBox: box,
+                centerX: 0.5,
+                centerY: 0.5,
+                orientedWidth: 0.8,
+                orientedHeight: 0.8,
+                rotationRadians: 0,
+                lineMasks: [
+                    OrientedLineMask(
+                        centerX: 0.5,
+                        centerY: 0.5,
+                        width: 0.8,
+                        height: 0.8,
+                        rotationRadians: 0,
+                        sampleBox: box
+                    )
+                ]
+            )
+        ]
     }
 }
 
-@MainActor
 enum LocalTranslator {
-    private struct Message: Codable {
-        let role: String
-        let content: String
-    }
-
-    private struct Options: Encodable {
-        let temperature: Double
-    }
-
-    private struct ChatRequest: Encodable {
+    struct ChatRequest: Encodable {
+        struct Message: Encodable {
+            let role: String
+            let content: String
+        }
+        struct Options: Encodable {
+            let temperature: Double
+        }
         let model: String
         let messages: [Message]
         let stream: Bool
@@ -664,170 +605,518 @@ enum LocalTranslator {
         let options: Options
     }
 
-    private struct ChatResponse: Decodable {
+    struct ChatResponse: Decodable {
+        struct Message: Decodable {
+            let content: String
+        }
         let message: Message
     }
 
-    private static var bubbleCache: [String: String] = [:]
-    private static let maxCacheEntries = 500
+    static func translateBubbles(
+        _ japaneseBubbles: [String],
+        glossary: [GlossaryEntry] = []
+    ) async -> [String] {
+        guard !japaneseBubbles.isEmpty else { return [] }
+        guard let url = URL(string: "http://127.0.0.1:11434/api/chat") else {
+            return japaneseBubbles.map { _ in "Invalid Ollama URL" }
+        }
 
-    static func clearCache() {
-        bubbleCache.removeAll()
-        print("Translation cache cleared")
+        let numberedInput = japaneseBubbles.enumerated()
+            .map { "[\($0.offset + 1)] \($0.element)" }
+            .joined(separator: "\n")
+
+        var glossaryInstruction = ""
+        let activeGlossary = glossary.filter {
+            !$0.japanese.trimmingCharacters(in: .whitespaces).isEmpty &&
+            !$0.english.trimmingCharacters(in: .whitespaces).isEmpty
+        }
+        if !activeGlossary.isEmpty {
+            let terms = activeGlossary
+                .map { "- \($0.japanese) = \($0.english)" }
+                .joined(separator: "\n")
+            glossaryInstruction = "\nAlways use these exact character/term translations when they appear:\n\(terms)\n"
+        }
+
+        let systemPrompt = """
+        You are a professional Japanese-to-English manga localization translator.
+        Translate each numbered Japanese manga speech bubble into natural, concise English dialogue that fits inside a comic speech bubble.
+        STRICT RULES:
+        - Output strictly in English using the Latin alphabet ONLY.
+        - NEVER output any Chinese (Hanzi) or Japanese (Kanji, Hiragana, Katakana) characters under any circumstances.
+        - Keep the exact [1], [2], ... numbering on separate lines, with no extra commentary or notes.\(glossaryInstruction)
+        """
+
+        let payload = ChatRequest(
+            model: "qwen2.5:7b",
+            messages: [
+                .init(role: "system", content: systemPrompt),
+                .init(role: "user", content: numberedInput)
+            ],
+            stream: false,
+            keep_alive: "30m",
+            options: .init(temperature: 0.1)
+        )
+
+        do {
+            var request = URLRequest(url: url)
+            request.httpMethod = "POST"
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.timeoutInterval = 30
+            request.httpBody = try JSONEncoder().encode(payload)
+
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+                return japaneseBubbles.map { _ in "Ollama error (is 'ollama serve' running?)" }
+            }
+
+            let decoded = try JSONDecoder().decode(ChatResponse.self, from: data)
+            let rawReply = decoded.message.content.trimmingCharacters(in: .whitespacesAndNewlines)
+            return parseNumberedLines(rawReply, expectedCount: japaneseBubbles.count)
+        } catch {
+            return japaneseBubbles.map { _ in "Connection failed: run 'ollama pull qwen2.5:7b'" }
+        }
     }
 
-    static func translateRegions(_ japaneseRegions: [String]) async throws -> [String] {
-        guard !japaneseRegions.isEmpty else { return [] }
+    private static func parseNumberedLines(_ reply: String, expectedCount: Int) -> [String] {
+        let lines = reply
+            .components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
 
-        var results = Array(repeating: "", count: japaneseRegions.count)
-        var uncachedIndices: [Int] = []
-        var uncachedTexts: [String] = []
+        var results = Array(repeating: "", count: expectedCount)
 
-        for (index, japanese) in japaneseRegions.enumerated() {
-            if let cached = bubbleCache[japanese] {
-                results[index] = cached
-            } else {
-                uncachedIndices.append(index)
-                uncachedTexts.append(japanese)
+        for line in lines {
+            if let closeBracket = line.firstIndex(of: "]"),
+               line.hasPrefix("[") {
+                let numStr = String(line[line.index(after: line.startIndex)..<closeBracket])
+                if let index = Int(numStr), index >= 1, index <= expectedCount {
+                    let textStart = line.index(after: closeBracket)
+                    let cleaned = String(line[textStart...]).trimmingCharacters(in: .whitespaces)
+                    results[index - 1] = stripCJKCharacters(from: cleaned)
+                }
             }
         }
 
-        if uncachedTexts.isEmpty {
-            print("Served all \(japaneseRegions.count) bubble(s) instantly from cache")
-            return results
-        }
-
-        print("Translating \(uncachedTexts.count) new bubble(s) (\(japaneseRegions.count - uncachedTexts.count) cached)")
-
-        let numberedInput = uncachedTexts.enumerated().map { idx, text in
-            "[\(idx + 1)] \(text.replacingOccurrences(of: "\n", with: " "))"
-        }.joined(separator: "\n")
-
-        let rawOutput = try await requestTranslation(
-            prompt: """
-            Translate each numbered Japanese manga speech bubble below into natural, concise English.
-            Rules:
-            - Keep the exact [1], [2], ... numbering, one per line, matching the input count (\(uncachedTexts.count)).
-            - Write 100% in English using the Latin alphabet. NEVER output any Chinese or Japanese characters.
-            - Output ONLY the numbered English lines with no extra commentary.
-
-            \(numberedInput)
-            """
-        )
-
-        let translatedNew = parseNumberedLines(rawOutput, expectedCount: uncachedTexts.count)
-
-        if bubbleCache.count > maxCacheEntries {
-            bubbleCache.removeAll(keepingCapacity: true)
-        }
-
-        for (offset, originalIndex) in uncachedIndices.enumerated() {
-            let cleanEnglish = stripCJKCharacters(from: translatedNew[offset])
-            results[originalIndex] = cleanEnglish
-            if !cleanEnglish.isEmpty {
-                bubbleCache[japaneseRegions[originalIndex]] = cleanEnglish
+        for i in 0..<expectedCount where results[i].isEmpty {
+            if i < lines.count {
+                results[i] = stripCJKCharacters(from: lines[i])
+            } else {
+                results[i] = "..."
             }
         }
 
         return results
     }
 
-    private static func requestTranslation(prompt: String) async throws -> String {
-        guard let url = URL(string: "http://127.0.0.1:11434/api/chat") else {
-            throw URLError(.badURL)
-        }
-
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.timeoutInterval = 60
-
-        let payload = ChatRequest(
-            model: "qwen2.5:7b",
-            messages: [
-                Message(
-                    role: "system",
-                    content: "You are a professional Japanese-to-English manga translator. You always write exclusively in natural English and never output Chinese or Japanese characters."
-                ),
-                Message(role: "user", content: prompt)
-            ],
-            stream: false,
-            keep_alive: "30m",
-            options: Options(temperature: 0.1)
-        )
-
-        request.httpBody = try JSONEncoder().encode(payload)
-
-        let data: Data
-        let response: URLResponse
-        do {
-            (data, response) = try await URLSession.shared.data(for: request)
-        } catch let urlError as URLError {
-            switch urlError.code {
-            case .cannotConnectToHost, .cannotFindHost, .networkConnectionLost, .timedOut:
-                throw TranslationError.ollamaUnavailable
-            default:
-                throw urlError
-            }
-        }
-
-        if let httpResponse = response as? HTTPURLResponse,
-           !(200...299).contains(httpResponse.statusCode) {
-            let body = String(data: data, encoding: .utf8) ?? ""
-            throw TranslationError.serverError(httpResponse.statusCode, body)
-        }
-
-        let decoded = try JSONDecoder().decode(ChatResponse.self, from: data)
-        let translation = decoded.message.content
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-
-        print("Translated text:\n\(translation)")
-        return translation
-    }
-
-    private static func parseNumberedLines(_ raw: String, expectedCount: Int) -> [String] {
-        let nonEmptyLines = raw
-            .components(separatedBy: .newlines)
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { !$0.isEmpty }
-
-        var cleanedLines: [String] = []
-        for line in nonEmptyLines {
-            if let closingBracket = line.firstIndex(of: "]"),
-               line.hasPrefix("[") {
-                let after = line[line.index(after: closingBracket)...]
-                    .trimmingCharacters(in: .whitespaces)
-                cleanedLines.append(after)
-            } else {
-                cleanedLines.append(line)
-            }
-        }
-
-        if cleanedLines.count == expectedCount {
-            return cleanedLines
-        }
-
-        if cleanedLines.count > expectedCount {
-            return Array(cleanedLines.prefix(expectedCount))
-        }
-        while cleanedLines.count < expectedCount {
-            cleanedLines.append("")
-        }
-        return cleanedLines
-    }
-
     private static func stripCJKCharacters(from text: String) -> String {
-        let filtered = text.unicodeScalars.filter { scalar in
-            switch scalar.value {
-            case 0x3040...0x30FF, // Hiragana & Katakana
-                 0x3400...0x4DBF, // CJK Extension A
-                 0x4E00...0x9FFF: // CJK Unified Ideographs
-                return false
-            default:
-                return true
+        let filteredScalars = text.unicodeScalars.filter { scalar in
+            let v = scalar.value
+            let isCJK = (0x4E00...0x9FFF).contains(v)
+                || (0x3400...0x4DBF).contains(v)
+                || (0x3040...0x309F).contains(v)
+                || (0x30A0...0x30FF).contains(v)
+                || (0xFF66...0xFF9F).contains(v)
+            return !isCJK
+        }
+        let cleaned = String(String.UnicodeScalarView(filteredScalars))
+            .replacingOccurrences(of: "  ", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return cleaned.isEmpty ? "..." : cleaned
+    }
+}
+
+@MainActor
+final class TransMangaModel: ObservableObject {
+    @Published var blocks: [RecognizedBlock] = []
+    @Published var statusMessage = "Position the cyan box over a manga page and press ⌃⌥M."
+    @Published var isBusy = false
+    @Published var lastCapturedImage: NSImage?
+    @Published var isAutoWatching = false
+    @Published var glossary: [GlossaryEntry] = [] {
+        didSet { saveGlossary() }
+    }
+
+    let store = OverlaySelectionStore.shared
+
+    private var bubbleCache: [String: String] = [:]
+    private var watchTimer: Timer?
+    private var lastVisualFingerprint: [UInt8]?
+    private var pendingStableTicks = 0
+    private var lastTranslatedFingerprint: [UInt8]?
+    private let glossaryStorageKey = "TransManga.Glossary.v1"
+
+    init() {
+        loadGlossary()
+        store.onTranslateRequested = { [weak self] in
+            Task { @MainActor in
+                self?.captureAndTranslate()
             }
         }
-        return String(String.UnicodeScalarView(filtered))
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        store.onToggleAutoWatch = { [weak self] in
+            Task { @MainActor in
+                self?.toggleAutoWatch()
+            }
+        }
+        store.onToggleClickThrough = { [weak self] in
+            Task { @MainActor in
+                self?.toggleClickThrough()
+            }
+        }
+    }
+
+    func addGlossaryEntry() {
+        glossary.append(GlossaryEntry(japanese: "", english: ""))
+    }
+
+    func removeGlossaryEntry(id: UUID) {
+        glossary.removeAll { $0.id == id }
+        bubbleCache.removeAll()
+    }
+
+    private func loadGlossary() {
+        guard let data = UserDefaults.standard.data(forKey: glossaryStorageKey),
+              let decoded = try? JSONDecoder().decode([GlossaryEntry].self, from: data) else {
+            return
+        }
+        glossary = decoded
+    }
+
+    private func saveGlossary() {
+        if let encoded = try? JSONEncoder().encode(glossary) {
+            UserDefaults.standard.set(encoded, forKey: glossaryStorageKey)
+        }
+    }
+
+    func toggleClickThrough() {
+        store.isClickThrough.toggle()
+        statusMessage = store.isClickThrough
+            ? "Reading mode locked (click-through ON). Press ⌃⌥O to edit box."
+            : "Edit mode active. Drag or resize the cyan box."
+    }
+
+    func toggleOverlayCards() {
+        store.showTranslationCards.toggle()
+        statusMessage = store.showTranslationCards
+            ? "Showing English overlay bubbles."
+            : "Peeking at original Japanese page (⌃⌥H to show English)."
+    }
+
+    func toggleAutoWatch() {
+        isAutoWatching.toggle()
+        store.isAutoWatching = isAutoWatching
+
+        if isAutoWatching {
+            statusMessage = "Auto-Watch ON (⌃⌥W): scrolling or turning pages will auto-translate."
+            startAutoWatchLoop()
+        } else {
+            statusMessage = "Auto-Watch paused."
+            stopAutoWatchLoop()
+        }
+    }
+
+    private func startAutoWatchLoop() {
+        stopAutoWatchLoop()
+        pendingStableTicks = 0
+        watchTimer = Timer.scheduledTimer(withTimeInterval: 0.35, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.checkScreenForChanges()
+            }
+        }
+    }
+
+    private func stopAutoWatchLoop() {
+        watchTimer?.invalidate()
+        watchTimer = nil
+    }
+
+    private func currentCaptureRect() -> CGRect? {
+        guard let screen = NSScreen.main else { return nil }
+        let screenFrame = screen.frame
+        let sel = store.normalizedSelection
+
+        let x = screenFrame.minX + sel.minX * screenFrame.width
+        let width = sel.width * screenFrame.width
+        let height = sel.height * screenFrame.height
+
+        let screenTopY = NSScreen.screens.first?.frame.height ?? screenFrame.height
+        let topDownScreenMinY = screenTopY - screenFrame.maxY
+        let y = topDownScreenMinY + sel.minY * screenFrame.height
+
+        return CGRect(x: x, y: y, width: width, height: height)
+    }
+
+    private func checkScreenForChanges() {
+        guard isAutoWatching, store.isVisible, !isBusy else { return }
+        guard let captureRect = currentCaptureRect() else { return }
+
+        let wasCardsVisible = store.showTranslationCards
+        store.showTranslationCards = false
+        guard let cgImage = ScreenCapture.captureRegion(captureRect) else {
+            store.showTranslationCards = wasCardsVisible
+            return
+        }
+
+        let currentFP = Self.computeFingerprint(for: cgImage)
+
+        if let lastFP = lastVisualFingerprint {
+            let diff = Self.fingerprintDifference(lastFP, currentFP)
+            if diff > 0.025 {
+                lastVisualFingerprint = currentFP
+                pendingStableTicks = 1
+                store.overlayBoxes = []
+                return
+            } else {
+                store.showTranslationCards = wasCardsVisible
+            }
+        } else {
+            store.showTranslationCards = wasCardsVisible
+            lastVisualFingerprint = currentFP
+            pendingStableTicks = 1
+            return
+        }
+
+        if pendingStableTicks > 0 {
+            pendingStableTicks += 1
+            if pendingStableTicks >= 2 {
+                pendingStableTicks = 0
+                if let lastTranslated = lastTranslatedFingerprint,
+                   Self.fingerprintDifference(lastTranslated, currentFP) <= 0.020 {
+                    return
+                }
+                lastTranslatedFingerprint = currentFP
+                captureAndTranslate()
+            }
+        }
+    }
+
+    private static func computeFingerprint(for cgImage: CGImage) -> [UInt8] {
+        let gridW = 32
+        let gridH = 32
+        var pixels = [UInt8](repeating: 0, count: gridW * gridH)
+        guard let context = CGContext(
+            data: &pixels,
+            width: gridW,
+            height: gridH,
+            bitsPerComponent: 8,
+            bytesPerRow: gridW,
+            space: CGColorSpaceCreateDeviceGray(),
+            bitmapInfo: CGImageAlphaInfo.none.rawValue
+        ) else {
+            return pixels
+        }
+        context.interpolationQuality = .low
+        context.draw(cgImage, in: CGRect(x: 0, y: 0, width: gridW, height: gridH))
+        return pixels
+    }
+
+    private static func fingerprintDifference(_ a: [UInt8], _ b: [UInt8]) -> Double {
+        guard a.count == b.count, !a.isEmpty else { return 1.0 }
+        var totalDiff = 0
+        for i in 0..<a.count {
+            totalDiff += abs(Int(a[i]) - Int(b[i]))
+        }
+        return Double(totalDiff) / Double(a.count * 255)
+    }
+
+    /// Samples the true local paper/screentone background color inside `normalizedBox`
+    /// by averaging the 65th–85th percentile luminance pixels (ignoring the darkest ~30% ink glyphs)
+    /// without clamping light greys/off-whites to pure white.
+    private static func sampleBubbleAppearance(in cgImage: CGImage, normalizedBox: CGRect) -> (bg: Color, fg: Color) {
+        let imgW = CGFloat(cgImage.width)
+        let imgH = CGFloat(cgImage.height)
+        let cropRect = CGRect(
+            x: max(0, normalizedBox.minX * imgW),
+            y: max(0, normalizedBox.minY * imgH),
+            width: min(imgW - max(0, normalizedBox.minX * imgW), max(6, normalizedBox.width * imgW)),
+            height: min(imgH - max(0, normalizedBox.minY * imgH), max(6, normalizedBox.height * imgH))
+        ).integral
+
+        guard cropRect.width >= 2, cropRect.height >= 2,
+              let cropped = cgImage.cropping(to: cropRect) else {
+            return (.white, .black)
+        }
+
+        let sampleSize = 20
+        var rgba = [UInt8](repeating: 0, count: sampleSize * sampleSize * 4)
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        guard let ctx = CGContext(
+            data: &rgba,
+            width: sampleSize,
+            height: sampleSize,
+            bitsPerComponent: 8,
+            bytesPerRow: sampleSize * 4,
+            space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else {
+            return (.white, .black)
+        }
+        ctx.interpolationQuality = .medium
+        ctx.draw(cropped, in: CGRect(x: 0, y: 0, width: sampleSize, height: sampleSize))
+
+        var pixels: [(r: Double, g: Double, b: Double, lum: Double)] = []
+        pixels.reserveCapacity(sampleSize * sampleSize)
+        for i in 0..<(sampleSize * sampleSize) {
+            let idx = i * 4
+            let r = Double(rgba[idx]) / 255.0
+            let g = Double(rgba[idx + 1]) / 255.0
+            let b = Double(rgba[idx + 2]) / 255.0
+            let lum = 0.2126 * r + 0.7152 * g + 0.0722 * b
+            pixels.append((r, g, b, lum))
+        }
+
+        guard !pixels.isEmpty else { return (.white, .black) }
+        pixels.sort { $0.lum < $1.lum }
+
+        let medianLum = pixels[pixels.count / 2].lum
+        let startIdx: Int
+        let endIdx: Int
+
+        if medianLum >= 0.36 {
+            // Dark text on white, off-white, or grey screentone background:
+            // Average the 65th–85th percentile pixels to capture the exact paper/screentone shade
+            startIdx = Int(Double(pixels.count - 1) * 0.65)
+            endIdx = max(startIdx, Int(Double(pixels.count - 1) * 0.85))
+        } else {
+            // Light text on dark/black flashback background:
+            // Average the 15th–35th percentile pixels to capture the dark fill
+            startIdx = Int(Double(pixels.count - 1) * 0.15)
+            endIdx = max(startIdx, Int(Double(pixels.count - 1) * 0.35))
+        }
+
+        var sumR = 0.0
+        var sumG = 0.0
+        var sumB = 0.0
+        var sumLum = 0.0
+        let count = Double(endIdx - startIdx + 1)
+
+        for i in startIdx...endIdx {
+            sumR += pixels[i].r
+            sumG += pixels[i].g
+            sumB += pixels[i].b
+            sumLum += pixels[i].lum
+        }
+
+        let avgR = sumR / count
+        let avgG = sumG / count
+        let avgB = sumB / count
+        let avgLum = sumLum / count
+
+        let bgColor = Color(red: avgR, green: avgG, blue: avgB)
+        let fgColor = avgLum >= 0.42
+            ? Color(red: 0.08, green: 0.08, blue: 0.10)
+            : Color(red: 0.96, green: 0.96, blue: 0.98)
+
+        return (bg: bgColor, fg: fgColor)
+    }
+
+    func captureAndTranslate() {
+        guard !isBusy else { return }
+        guard let captureRect = currentCaptureRect() else {
+            statusMessage = "Unable to determine screen capture region."
+            return
+        }
+
+        isBusy = true
+        statusMessage = "Capturing selected region..."
+
+        Task {
+            let wasShowingCards = store.showTranslationCards
+            store.showTranslationCards = false
+            try? await Task.sleep(nanoseconds: 120_000_000)
+
+            guard let cgImage = ScreenCapture.captureRegion(captureRect) else {
+                store.showTranslationCards = wasShowingCards
+                statusMessage = "Screen capture failed. Check Screen Recording permission in System Settings."
+                isBusy = false
+                return
+            }
+
+            let fp = Self.computeFingerprint(for: cgImage)
+            lastVisualFingerprint = fp
+            lastTranslatedFingerprint = fp
+            lastCapturedImage = NSImage(cgImage: cgImage, size: captureRect.size)
+
+            do {
+                statusMessage = "Detecting Japanese speech bubbles..."
+                var detectedBlocks = try await MangaOCR.recognizeBubbleClusters(from: cgImage)
+
+                if detectedBlocks.isEmpty {
+                    blocks = []
+                    store.overlayBoxes = []
+                    statusMessage = "No Japanese text detected in the selected area."
+                    isBusy = false
+                    return
+                }
+
+                // Sample both the overall bubble color and each individual line mask's local background color
+                var appearances: [(bg: Color, fg: Color)] = []
+                for i in 0..<detectedBlocks.count {
+                    let bubbleColor = Self.sampleBubbleAppearance(
+                        in: cgImage,
+                        normalizedBox: detectedBlocks[i].boundingBox
+                    )
+                    appearances.append(bubbleColor)
+
+                    for mIdx in 0..<detectedBlocks[i].lineMasks.count {
+                        let lineSample = Self.sampleBubbleAppearance(
+                            in: cgImage,
+                            normalizedBox: detectedBlocks[i].lineMasks[mIdx].sampleBox
+                        )
+                        detectedBlocks[i].lineMasks[mIdx].backgroundColor = lineSample.bg
+                    }
+                }
+
+                var uncachedIndices: [Int] = []
+                var uncachedJapanese: [String] = []
+
+                for (i, block) in detectedBlocks.enumerated() {
+                    if let cachedEnglish = bubbleCache[block.japaneseText] {
+                        detectedBlocks[i].englishText = cachedEnglish
+                    } else {
+                        uncachedIndices.append(i)
+                        uncachedJapanese.append(block.japaneseText)
+                    }
+                }
+
+                blocks = detectedBlocks
+
+                if !uncachedJapanese.isEmpty {
+                    statusMessage = "Translating \(uncachedJapanese.count) bubble(s) (\(detectedBlocks.count - uncachedJapanese.count) cached)..."
+                    let freshTranslations = await LocalTranslator.translateBubbles(
+                        uncachedJapanese,
+                        glossary: glossary
+                    )
+                    for (offset, blockIdx) in uncachedIndices.enumerated() where offset < freshTranslations.count {
+                        let english = freshTranslations[offset]
+                        detectedBlocks[blockIdx].englishText = english
+                        bubbleCache[detectedBlocks[blockIdx].japaneseText] = english
+                    }
+                }
+
+                blocks = detectedBlocks
+                store.overlayBoxes = detectedBlocks.enumerated().map { i, block in
+                    OverlayTranslationBox(
+                        index: block.index,
+                        text: block.englishText,
+                        boundingBox: block.boundingBox,
+                        centerX: block.centerX,
+                        centerY: block.centerY,
+                        orientedWidth: block.orientedWidth,
+                        orientedHeight: block.orientedHeight,
+                        rotationRadians: block.rotationRadians,
+                        lineMasks: block.lineMasks,
+                        backgroundColor: appearances[i].bg,
+                        textColor: appearances[i].fg
+                    )
+                }
+                store.showTranslationCards = true
+                statusMessage = "Translated \(detectedBlocks.count) speech bubble(s)."
+            } catch {
+                store.showTranslationCards = wasShowingCards
+                statusMessage = "OCR Error: \(error.localizedDescription)"
+            }
+
+            isBusy = false
+        }
     }
 }
