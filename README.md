@@ -1,4 +1,4 @@
-<img src="appicon.png" alt="App Icon" width="160">
+<img src="AppIcon.png" width="160">
 
 # TransManga (MangaTranslationfordweebs)
 
