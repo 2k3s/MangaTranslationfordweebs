@@ -2,6 +2,11 @@ import Foundation
 
 // MARK: - Protocols (Interface Segregation & Dependency Inversion)
 
+protocol OllamaDaemonManaging {
+    func isServerReachable() async -> Bool
+    func ensureServerRunning() async -> Bool
+}
+
 protocol MangaTranslating {
     func fetchInstalledModels() async -> [String]
     func translateBubbles(
@@ -27,7 +32,72 @@ protocol TranslationResponseParsing {
     func stripCJKCharacters(from text: String) -> String
 }
 
-// MARK: - 1. Prompt Builder (Single Responsibility: Prompt Construction)
+// MARK: - 1. Ollama Daemon Manager (Single Responsibility: Background Server Lifecycle)
+
+final class OllamaDaemonManager: OllamaDaemonManaging {
+    private var backgroundProcess: Process?
+
+    func isServerReachable() async -> Bool {
+        guard let url = URL(string: "http://127.0.0.1:11434/api/tags") else { return false }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 1.5
+        do {
+            let (_, response) = try await URLSession.shared.data(for: request)
+            return (response as? HTTPURLResponse)?.statusCode == 200
+        } catch {
+            return false
+        }
+    }
+
+    func ensureServerRunning() async -> Bool {
+        if await isServerReachable() {
+            return true
+        }
+
+        guard let executablePath = Self.locateOllamaBinary() else {
+            return false
+        }
+
+        if backgroundProcess == nil || !(backgroundProcess?.isRunning ?? false) {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: executablePath)
+            process.arguments = ["serve"]
+            process.standardOutput = FileHandle.nullDevice
+            process.standardError = FileHandle.nullDevice
+
+            do {
+                try process.run()
+                backgroundProcess = process
+            } catch {
+                return false
+            }
+        }
+
+        // Poll up to 10 times (4 seconds total) for the server to start accepting connections
+        for _ in 0..<10 {
+            try? await Task.sleep(nanoseconds: 400_000_000)
+            if await isServerReachable() {
+                return true
+            }
+        }
+
+        return await isServerReachable()
+    }
+
+    private static func locateOllamaBinary() -> String? {
+        let candidatePaths = [
+            "/opt/homebrew/bin/ollama",
+            "/usr/local/bin/ollama",
+            "/Applications/Ollama.app/Contents/Resources/ollama"
+        ]
+        for path in candidatePaths where FileManager.default.isExecutableFile(atPath: path) {
+            return path
+        }
+        return nil
+    }
+}
+
+// MARK: - 2. Prompt Builder (Single Responsibility: Prompt Construction)
 
 struct MangaPromptBuilder: MangaPromptBuilding {
     func buildSystemPrompt(
@@ -93,7 +163,7 @@ struct MangaPromptBuilder: MangaPromptBuilding {
     }
 }
 
-// MARK: - 2. Response Parser (Single Responsibility: Line Parsing & CJK Sanitization)
+// MARK: - 3. Response Parser (Single Responsibility: Line Parsing & CJK Sanitization)
 
 struct TranslationResponseParser: TranslationResponseParsing {
     func parseNumberedLines(_ reply: String, expectedCount: Int) -> [String] {
@@ -144,7 +214,7 @@ struct TranslationResponseParser: TranslationResponseParsing {
     }
 }
 
-// MARK: - 3. Ollama Translation Service (Single Responsibility: Local HTTP Client)
+// MARK: - 4. Ollama Translation Service (Single Responsibility: Local HTTP Client)
 
 struct OllamaTranslationService: MangaTranslating {
     private let promptBuilder: MangaPromptBuilding

@@ -138,12 +138,13 @@ struct ContentView: View {
                     }
                     Divider()
                     Button("Refresh Installed Models") {
-                        Task { await model.refreshOllamaModels() }
+                        Task { await model.bootstrapOllamaAndModels() }
                     }
                 } label: {
                     HStack(spacing: 6) {
-                        Image(systemName: "cpu")
-                            .font(.system(size: 11, weight: .medium))
+                        Circle()
+                            .fill(model.isOllamaOnline ? Color.green : Color.orange)
+                            .frame(width: 7, height: 7)
                         Text(store.selectedModel)
                             .font(.system(size: 12, weight: .medium, design: .rounded))
                         Image(systemName: "chevron.up.chevron.down")

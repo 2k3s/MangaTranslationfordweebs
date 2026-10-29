@@ -9,6 +9,7 @@ final class TransMangaModel: ObservableObject {
     @Published var isBusy = false
     @Published var lastCapturedImage: NSImage?
     @Published var isAutoWatching = false
+    @Published var isOllamaOnline = false
     @Published var glossary: [GlossaryEntry] = [] {
         didSet { saveGlossary() }
     }
@@ -18,6 +19,7 @@ final class TransMangaModel: ObservableObject {
     private let screenCaptureService: ScreenCapturing
     private let ocrService: OCRRecognizing
     private let translationService: MangaTranslating
+    private let daemonManager: OllamaDaemonManaging
 
     private var bubbleCache: [String: String] = [:]
     private var recentContext: [(japanese: String, english: String)] = []
@@ -30,17 +32,19 @@ final class TransMangaModel: ObservableObject {
     init(
         screenCaptureService: ScreenCapturing = CoreGraphicsScreenCaptureService(),
         ocrService: OCRRecognizing = VisionKitMangaOCRService(),
-        translationService: MangaTranslating = OllamaTranslationService()
+        translationService: MangaTranslating = OllamaTranslationService(),
+        daemonManager: OllamaDaemonManaging = OllamaDaemonManager()
     ) {
         self.screenCaptureService = screenCaptureService
         self.ocrService = ocrService
         self.translationService = translationService
+        self.daemonManager = daemonManager
 
         loadGlossary()
         bindOverlayStoreCallbacks()
 
         Task {
-            await refreshOllamaModels()
+            await bootstrapOllamaAndModels()
         }
     }
 
@@ -61,7 +65,17 @@ final class TransMangaModel: ObservableObject {
             self?.blocks.removeAll { $0.id == id }
         }
         store.onRefreshModelsRequested = { [weak self] in
-            Task { @MainActor in await self?.refreshOllamaModels() }
+            Task { @MainActor in await self?.bootstrapOllamaAndModels() }
+        }
+    }
+
+    func bootstrapOllamaAndModels() async {
+        let ready = await daemonManager.ensureServerRunning()
+        isOllamaOnline = ready
+        if ready {
+            await refreshOllamaModels()
+        } else {
+            statusMessage = "Ollama not found. Install Ollama to translate locally."
         }
     }
 
@@ -93,6 +107,7 @@ final class TransMangaModel: ObservableObject {
         let chosenModel = store.selectedModel
 
         Task {
+            _ = await daemonManager.ensureServerRunning()
             let breakdown = await translationService.explainJapaneseBreakdown(jpText, model: chosenModel)
             if let currentIdx = blocks.firstIndex(where: { $0.id == blockID }) {
                 blocks[currentIdx].breakdownText = breakdown
@@ -249,6 +264,10 @@ final class TransMangaModel: ObservableObject {
         statusMessage = "Capturing selected region..."
 
         Task {
+            if !isOllamaOnline {
+                isOllamaOnline = await daemonManager.ensureServerRunning()
+            }
+
             guard let cgImage = screenCaptureService.captureRegion(
                 captureRect,
                 belowWindowID: store.overlayWindowID
@@ -317,7 +336,9 @@ final class TransMangaModel: ObservableObject {
                     for (offset, blockIdx) in uncachedIndices.enumerated() where offset < freshTranslations.count {
                         let english = freshTranslations[offset]
                         detectedBlocks[blockIdx].englishText = english
-                        bubbleCache[detectedBlocks[blockIdx].japaneseText] = english
+                        if english != "..." {
+                            bubbleCache[detectedBlocks[blockIdx].japaneseText] = english
+                        }
                     }
                 }
 
@@ -361,6 +382,10 @@ final class TransMangaModel: ObservableObject {
         statusMessage = "Translating manually selected box..."
 
         Task {
+            if !isOllamaOnline {
+                isOllamaOnline = await daemonManager.ensureServerRunning()
+            }
+
             guard let fullCGImage = screenCaptureService.captureRegion(
                 fullCaptureRect,
                 belowWindowID: store.overlayWindowID
@@ -409,7 +434,9 @@ final class TransMangaModel: ObservableObject {
                         recentContext: recentContext
                     )
                     english = translated.first ?? "..."
-                    bubbleCache[combinedJP] = english
+                    if english != "..." {
+                        bubbleCache[combinedJP] = english
+                    }
                 }
 
                 appendToRollingContext(japanese: combinedJP, english: english)
