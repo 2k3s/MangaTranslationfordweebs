@@ -1,4 +1,5 @@
 import Foundation
+import AppKit
 import CoreGraphics
 import SwiftUI
 
@@ -7,6 +8,15 @@ protocol ScreenCapturing {
     func computeFingerprint(for cgImage: CGImage) -> [UInt8]
     func fingerprintDifference(_ a: [UInt8], _ b: [UInt8]) -> Double
     func sampleBubbleAppearance(in cgImage: CGImage, normalizedBox: CGRect) -> (bg: Color, fg: Color)
+}
+
+@MainActor
+protocol SnapshotExporting {
+    func exportSnapshot(
+        baseCGImage: CGImage,
+        boxes: [OverlayTranslationBox],
+        displaySize: CGSize
+    ) -> URL?
 }
 
 struct CoreGraphicsScreenCaptureService: ScreenCapturing {
@@ -115,10 +125,7 @@ struct CoreGraphicsScreenCaptureService: ScreenCapturing {
             endIdx = max(startIdx, Int(Double(pixels.count - 1) * 0.35))
         }
 
-        var sumR = 0.0
-        var sumG = 0.0
-        var sumB = 0.0
-        var sumLum = 0.0
+        var sumR = 0.0, sumG = 0.0, sumB = 0.0, sumLum = 0.0
         let count = Double(endIdx - startIdx + 1)
 
         for i in startIdx...endIdx {
@@ -139,5 +146,126 @@ struct CoreGraphicsScreenCaptureService: ScreenCapturing {
             : Color(red: 0.96, green: 0.96, blue: 0.98)
 
         return (bg: bgColor, fg: fgColor)
+    }
+}
+
+@MainActor
+struct MangaSnapshotExporter: SnapshotExporting {
+    func exportSnapshot(
+        baseCGImage: CGImage,
+        boxes: [OverlayTranslationBox],
+        displaySize: CGSize
+    ) -> URL? {
+        let boxWidth = max(120, displaySize.width)
+        let boxHeight = max(120, displaySize.height)
+
+        let compositeView = SnapshotCompositeView(
+            baseCGImage: baseCGImage,
+            boxes: boxes,
+            boxWidth: boxWidth,
+            boxHeight: boxHeight
+        )
+
+        let renderer = ImageRenderer(content: compositeView)
+        renderer.scale = NSScreen.main?.backingScaleFactor ?? 2.0
+
+        guard let nsImage = renderer.nsImage else { return nil }
+
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.writeObjects([nsImage])
+
+        guard let tiffData = nsImage.tiffRepresentation,
+              let bitmap = NSBitmapImageRep(data: tiffData),
+              let pngData = bitmap.representation(using: .png, properties: [:]) else {
+            return nil
+        }
+
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd_HH-mm-ss"
+        let filename = "TransManga_\(formatter.string(from: Date())).png"
+
+        let downloadsURL = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSTemporaryDirectory())
+        let fileURL = downloadsURL.appendingPathComponent(filename)
+
+        do {
+            try pngData.write(to: fileURL, options: .atomic)
+            return fileURL
+        } catch {
+            return nil
+        }
+    }
+}
+
+private struct SnapshotCompositeView: View {
+    let baseCGImage: CGImage
+    let boxes: [OverlayTranslationBox]
+    let boxWidth: CGFloat
+    let boxHeight: CGFloat
+
+    var body: some View {
+        ZStack(alignment: .topLeading) {
+            Image(decorative: baseCGImage, scale: 1.0)
+                .resizable()
+                .frame(width: boxWidth, height: boxHeight)
+
+            ForEach(boxes) { box in
+                let cx = box.centerX * boxWidth
+                let cy = box.centerY * boxHeight
+                let rawW = max(22, box.orientedWidth * boxWidth)
+                let rawH = max(18, box.orientedHeight * boxHeight)
+
+                let textFrameW = box.isManualSelection ? rawW : max(rawW + 2, 34)
+                let textFrameH = box.isManualSelection ? rawH : max(rawH + 2, 18)
+
+                let layout = SelectionOverlayView.layoutMangaText(
+                    box.text.uppercased(),
+                    width: textFrameW,
+                    height: textFrameH
+                )
+
+                ZStack {
+                    ForEach(box.lineMasks) { mask in
+                        let pad: CGFloat = box.isManualSelection ? 0 : 3
+                        let mW = max(8, mask.width * boxWidth + pad)
+                        let mH = max(8, mask.height * boxHeight + pad)
+                        RoundedRectangle(cornerRadius: min(mW, mH) * 0.22, style: .continuous)
+                            .fill(mask.backgroundColor)
+                            .frame(width: mW, height: mH)
+                            .rotationEffect(.radians(mask.rotationRadians))
+                            .position(
+                                x: mask.centerX * boxWidth,
+                                y: mask.centerY * boxHeight
+                            )
+                    }
+
+                    VStack(spacing: 1) {
+                        ForEach(Array(layout.lines.enumerated()), id: \.offset) { _, line in
+                            Text(line)
+                                .font(.system(
+                                    size: layout.fontSize,
+                                    weight: .bold,
+                                    design: .rounded
+                                ))
+                                .foregroundColor(box.textColor)
+                                .lineLimit(1)
+                                .minimumScaleFactor(0.35)
+                                .allowsTightening(true)
+                        }
+                    }
+                    .padding(.horizontal, 3)
+                    .padding(.vertical, 1.5)
+                    .background(
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .fill(box.backgroundColor)
+                    )
+                    .frame(width: textFrameW, height: textFrameH, alignment: .center)
+                    .rotationEffect(.radians(box.rotationRadians))
+                    .position(x: cx, y: cy)
+                }
+            }
+        }
+        .frame(width: boxWidth, height: boxHeight)
     }
 }

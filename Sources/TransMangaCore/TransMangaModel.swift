@@ -20,6 +20,7 @@ final class TransMangaModel: ObservableObject {
     private let ocrService: OCRRecognizing
     private let translationService: MangaTranslating
     private let daemonManager: OllamaDaemonManaging
+    private let snapshotExporter: SnapshotExporting
 
     private var bubbleCache: [String: String] = [:]
     private var recentContext: [(japanese: String, english: String)] = []
@@ -27,24 +28,31 @@ final class TransMangaModel: ObservableObject {
     private var lastVisualFingerprint: [UInt8]?
     private var pendingStableTicks = 0
     private var lastTranslatedFingerprint: [UInt8]?
+    private var activeTranslationTask: Task<Void, Never>?
+    private(set) var captureGeneration: UInt64 = 0
     private let glossaryStorageKey = "TransManga.Glossary.v1"
 
     init(
         screenCaptureService: ScreenCapturing = CoreGraphicsScreenCaptureService(),
         ocrService: OCRRecognizing = VisionKitMangaOCRService(),
         translationService: MangaTranslating = OllamaTranslationService(),
-        daemonManager: OllamaDaemonManaging = OllamaDaemonManager()
+        daemonManager: OllamaDaemonManaging = OllamaDaemonManager(),
+        snapshotExporter: SnapshotExporting? = nil,
+        autoBootstrap: Bool = true
     ) {
         self.screenCaptureService = screenCaptureService
         self.ocrService = ocrService
         self.translationService = translationService
         self.daemonManager = daemonManager
+        self.snapshotExporter = snapshotExporter ?? MangaSnapshotExporter()
 
         loadGlossary()
         bindOverlayStoreCallbacks()
 
-        Task {
-            await bootstrapOllamaAndModels()
+        if autoBootstrap {
+            Task {
+                await bootstrapOllamaAndModels()
+            }
         }
     }
 
@@ -66,6 +74,42 @@ final class TransMangaModel: ObservableObject {
         }
         store.onRefreshModelsRequested = { [weak self] in
             Task { @MainActor in await self?.bootstrapOllamaAndModels() }
+        }
+        store.onSnapshotRequested = { [weak self] in
+            Task { @MainActor in self?.exportTranslatedSnapshot() }
+        }
+        store.onOverlayVisibilityChanged = { [weak self] visible in
+            if !visible {
+                self?.cancelActiveTranslation()
+            }
+        }
+    }
+
+    func cancelActiveTranslation() {
+        captureGeneration &+= 1
+        activeTranslationTask?.cancel()
+        activeTranslationTask = nil
+        isBusy = false
+    }
+
+    func exportTranslatedSnapshot() {
+        guard let captureRect = currentCaptureRect(),
+              let cgImage = screenCaptureService.captureRegion(
+                  captureRect,
+                  belowWindowID: store.overlayWindowID
+              ) else {
+            statusMessage = "Failed to capture region for snapshot."
+            return
+        }
+
+        if let savedURL = snapshotExporter.exportSnapshot(
+            baseCGImage: cgImage,
+            boxes: store.overlayBoxes,
+            displaySize: captureRect.size
+        ) {
+            statusMessage = "Copied snapshot to Clipboard & saved \(savedURL.lastPathComponent) to Downloads!"
+        } else {
+            statusMessage = "Snapshot export failed."
         }
     }
 
@@ -209,7 +253,7 @@ final class TransMangaModel: ObservableObject {
     }
 
     private func checkScreenForChanges() {
-        guard isAutoWatching, store.isVisible, !isBusy else { return }
+        guard isAutoWatching, store.isVisible else { return }
         guard let captureRect = currentCaptureRect() else { return }
 
         guard let cgImage = screenCaptureService.captureRegion(
@@ -224,6 +268,10 @@ final class TransMangaModel: ObservableObject {
         if let lastFP = lastVisualFingerprint {
             let diff = screenCaptureService.fingerprintDifference(lastFP, currentFP)
             if diff > 0.025 {
+                // Page scrolled or changed: cancel any in-flight translation from the old page immediately
+                if isBusy {
+                    cancelActiveTranslation()
+                }
                 lastVisualFingerprint = currentFP
                 pendingStableTicks = 1
                 store.overlayBoxes = []
@@ -234,6 +282,8 @@ final class TransMangaModel: ObservableObject {
             pendingStableTicks = 1
             return
         }
+
+        guard !isBusy else { return }
 
         if pendingStableTicks > 0 {
             pendingStableTicks += 1
@@ -250,7 +300,6 @@ final class TransMangaModel: ObservableObject {
     }
 
     func captureAndTranslate() {
-        guard !isBusy else { return }
         guard store.isVisible else {
             statusMessage = "Turn ON the translation box first."
             return
@@ -260,20 +309,28 @@ final class TransMangaModel: ObservableObject {
             return
         }
 
+        cancelActiveTranslation()
+        let generation = captureGeneration
         isBusy = true
         statusMessage = "Capturing selected region..."
 
-        Task {
+        activeTranslationTask = Task {
+            defer {
+                if self.captureGeneration == generation {
+                    self.isBusy = false
+                }
+            }
+
             if !isOllamaOnline {
                 isOllamaOnline = await daemonManager.ensureServerRunning()
             }
+            guard !Task.isCancelled, self.captureGeneration == generation else { return }
 
             guard let cgImage = screenCaptureService.captureRegion(
                 captureRect,
                 belowWindowID: store.overlayWindowID
             ) else {
                 statusMessage = "Screen capture failed. Check Screen Recording permission in System Settings."
-                isBusy = false
                 return
             }
 
@@ -285,12 +342,12 @@ final class TransMangaModel: ObservableObject {
             do {
                 statusMessage = "Detecting Japanese speech bubbles..."
                 var detectedBlocks = try await ocrService.recognizeBubbleClusters(from: cgImage)
+                guard !Task.isCancelled, self.captureGeneration == generation else { return }
 
                 if detectedBlocks.isEmpty {
                     blocks = []
                     store.overlayBoxes = []
                     statusMessage = "No Japanese text detected in the selected area."
-                    isBusy = false
                     return
                 }
 
@@ -327,12 +384,14 @@ final class TransMangaModel: ObservableObject {
 
                 if !uncachedJapanese.isEmpty {
                     statusMessage = "Translating \(uncachedJapanese.count) bubble(s) with \(store.selectedModel)..."
-                    let freshTranslations = await translationService.translateBubbles(
+                    let freshTranslations = try await translationService.translateBubbles(
                         uncachedJapanese,
                         model: store.selectedModel,
                         glossary: glossary,
                         recentContext: recentContext
                     )
+                    guard !Task.isCancelled, self.captureGeneration == generation else { return }
+
                     for (offset, blockIdx) in uncachedIndices.enumerated() where offset < freshTranslations.count {
                         let english = freshTranslations[offset]
                         detectedBlocks[blockIdx].englishText = english
@@ -366,11 +425,12 @@ final class TransMangaModel: ObservableObject {
                 }
                 store.showTranslationCards = true
                 statusMessage = "Translated \(detectedBlocks.count) speech bubble(s)."
+            } catch is CancellationError {
+                return
             } catch {
-                statusMessage = "OCR Error: \(error.localizedDescription)"
+                guard !Task.isCancelled, self.captureGeneration == generation else { return }
+                statusMessage = error.localizedDescription
             }
-
-            isBusy = false
         }
     }
 
@@ -378,20 +438,27 @@ final class TransMangaModel: ObservableObject {
         guard !isBusy else { return }
         guard let fullCaptureRect = currentCaptureRect() else { return }
 
+        let generation = captureGeneration
         isBusy = true
         statusMessage = "Translating manually selected box..."
 
-        Task {
+        activeTranslationTask = Task {
+            defer {
+                if self.captureGeneration == generation {
+                    self.isBusy = false
+                }
+            }
+
             if !isOllamaOnline {
                 isOllamaOnline = await daemonManager.ensureServerRunning()
             }
+            guard !Task.isCancelled, self.captureGeneration == generation else { return }
 
             guard let fullCGImage = screenCaptureService.captureRegion(
                 fullCaptureRect,
                 belowWindowID: store.overlayWindowID
             ) else {
                 statusMessage = "Screen capture failed."
-                isBusy = false
                 return
             }
 
@@ -406,12 +473,13 @@ final class TransMangaModel: ObservableObject {
 
             guard let subCGImage = fullCGImage.cropping(to: cropRect) else {
                 statusMessage = "Manual selection was too small."
-                isBusy = false
                 return
             }
 
             do {
                 let subClusters = try await ocrService.recognizeBubbleClusters(from: subCGImage)
+                guard !Task.isCancelled, self.captureGeneration == generation else { return }
+
                 let combinedJP = subClusters
                     .map(\.japaneseText)
                     .joined(separator: " ")
@@ -419,7 +487,6 @@ final class TransMangaModel: ObservableObject {
 
                 guard !combinedJP.isEmpty else {
                     statusMessage = "No Japanese text detected inside the manual box."
-                    isBusy = false
                     return
                 }
 
@@ -427,12 +494,13 @@ final class TransMangaModel: ObservableObject {
                 if let cached = bubbleCache[combinedJP] {
                     english = cached
                 } else {
-                    let translated = await translationService.translateBubbles(
+                    let translated = try await translationService.translateBubbles(
                         [combinedJP],
                         model: store.selectedModel,
                         glossary: glossary,
                         recentContext: recentContext
                     )
+                    guard !Task.isCancelled, self.captureGeneration == generation else { return }
                     english = translated.first ?? "..."
                     if english != "..." {
                         bubbleCache[combinedJP] = english
@@ -492,11 +560,12 @@ final class TransMangaModel: ObservableObject {
                 store.overlayBoxes.append(newBox)
                 store.showTranslationCards = true
                 statusMessage = "Added manual translation #\(nextIndex)."
+            } catch is CancellationError {
+                return
             } catch {
-                statusMessage = "Manual OCR Error: \(error.localizedDescription)"
+                guard !Task.isCancelled, self.captureGeneration == generation else { return }
+                statusMessage = error.localizedDescription
             }
-
-            isBusy = false
         }
     }
 }

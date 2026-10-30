@@ -22,6 +22,8 @@ final class OverlaySelectionStore: ObservableObject {
     var onManualSubBoxSelected: ((CGRect) -> Void)?
     var onRemoveBox: ((UUID) -> Void)?
     var onRefreshModelsRequested: (() -> Void)?
+    var onSnapshotRequested: (() -> Void)?
+    var onOverlayVisibilityChanged: ((Bool) -> Void)?
 
     private init() {}
 
@@ -66,6 +68,7 @@ final class OverlayWindowController: NSObject {
                 } else {
                     self.panel?.orderOut(nil)
                 }
+                self.store.onOverlayVisibilityChanged?(visible)
             }
             .store(in: &cancellables)
     }
@@ -118,6 +121,8 @@ struct SelectionOverlayView: View {
     @State private var manualCurrentLocal: CGPoint? = nil
     @State private var isCornerMenuExpanded = false
 
+    private static var layoutCache: [String: (lines: [String], fontSize: CGFloat)] = [:]
+
     var body: some View {
         GeometryReader { geo in
             let rect = store.normalizedSelection
@@ -155,7 +160,7 @@ struct SelectionOverlayView: View {
                             let textFrameW = box.isManualSelection ? rawW : max(rawW + 2, 34)
                             let textFrameH = box.isManualSelection ? rawH : max(rawH + 2, 18)
 
-                            let layout = layoutMangaText(
+                            let layout = Self.layoutMangaText(
                                 box.text.uppercased(),
                                 width: textFrameW,
                                 height: textFrameH
@@ -362,7 +367,12 @@ struct SelectionOverlayView: View {
         .ignoresSafeArea()
     }
 
-    private func layoutMangaText(_ text: String, width: CGFloat, height: CGFloat) -> (lines: [String], fontSize: CGFloat) {
+    static func layoutMangaText(_ text: String, width: CGFloat, height: CGFloat) -> (lines: [String], fontSize: CGFloat) {
+        let cacheKey = "\(text)|\(Int(width.rounded()))|\(Int(height.rounded()))"
+        if let cached = layoutCache[cacheKey] {
+            return cached
+        }
+
         let usableW = max(18, width - 6)
         let usableH = max(12, height - 4)
 
@@ -418,7 +428,12 @@ struct SelectionOverlayView: View {
             }
         }
 
-        return (bestLines, min(max(bestFontSize, 5.5), 18.0))
+        let computed = (bestLines, min(max(bestFontSize, 5.5), 18.0))
+        if layoutCache.count > 256 {
+            layoutCache.removeAll(keepingCapacity: true)
+        }
+        layoutCache[cacheKey] = computed
+        return computed
     }
 }
 
@@ -426,6 +441,7 @@ struct ExpandingTopRightOverlayMenu: View {
     @Binding var isExpanded: Bool
     @ObservedObject var store: OverlaySelectionStore
     @State private var translateFlash = false
+    @State private var snapshotFlash = false
     @State private var lockFlash = false
 
     var body: some View {
@@ -505,6 +521,24 @@ struct ExpandingTopRightOverlayMenu: View {
                     }
 
                     OverlayPillItemButton(
+                        isActive: snapshotFlash,
+                        action: {
+                            withAnimation(.easeInOut(duration: 0.15)) {
+                                snapshotFlash = true
+                            }
+                            store.onSnapshotRequested?()
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                                withAnimation(.easeOut(duration: 0.2)) {
+                                    snapshotFlash = false
+                                }
+                            }
+                        }
+                    ) {
+                        Image(systemName: "camera.fill")
+                            .font(.system(size: 12.5, weight: .semibold))
+                    }
+
+                    OverlayPillItemButton(
                         isActive: lockFlash,
                         action: {
                             withAnimation(.easeInOut(duration: 0.15)) {
@@ -554,7 +588,7 @@ struct ExpandingTopRightOverlayMenu: View {
                 .transition(.opacity)
             }
         }
-        .frame(width: isExpanded ? 242 : 36, height: 36)
+        .frame(width: isExpanded ? 282 : 36, height: 36)
         .animation(.spring(response: 0.34, dampingFraction: 0.78), value: isExpanded)
     }
 }
