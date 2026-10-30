@@ -1,3 +1,5 @@
+<img src="AppIcon.png" width="160">
+
 # TransManga (MangaTranslationfordweebs)
 
 A macOS app I made to translate raw Japanese manga directly on my screen. It uses Apple's built-in Live Text (`VisionKit`) for vertical Japanese OCR and a local [Ollama](https://ollama.com/) model (`qwen2.5:7b` or `qwen2.5:14b`) for translation, so everything runs offline on your Mac without needing paid API keys.
