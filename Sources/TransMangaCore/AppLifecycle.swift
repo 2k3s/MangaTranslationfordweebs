@@ -2,7 +2,7 @@ import SwiftUI
 import AppKit
 import Carbon
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+public final class AppDelegate: NSObject, NSApplicationDelegate {
     private var translateHotKeyRef: EventHotKeyRef?
     private var clickThroughHotKeyRef: EventHotKeyRef?
     private var autoWatchHotKeyRef: EventHotKeyRef?
@@ -10,7 +10,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var eventHandlerRef: EventHandlerRef?
     private let overlayController = OverlayWindowController()
 
-    func applicationDidFinishLaunching(_ notification: Notification) {
+    public override init() {
+        super.init()
+    }
+
+    public func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
 
@@ -83,10 +87,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
-struct MenuBarControlView: View {
+public struct MenuBarControlView: View {
     @ObservedObject var store = OverlaySelectionStore.shared
 
-    var body: some View {
+    public init() {}
+
+    public var body: some View {
         Toggle("Translation Box ON", isOn: $store.isVisible)
 
         Divider()
@@ -133,21 +139,6 @@ struct MenuBarControlView: View {
 
         Button("Quit TransManga") {
             NSApplication.shared.terminate(nil)
-        }
-    }
-}
-
-@main
-struct TransMangaApp: App {
-    @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
-
-    var body: some Scene {
-        WindowGroup("TransManga") {
-            ContentView()
-        }
-
-        MenuBarExtra("TransManga", systemImage: "cat.fill") {
-            MenuBarControlView()
         }
     }
 }

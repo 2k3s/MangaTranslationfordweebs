@@ -1,13 +1,15 @@
 import SwiftUI
 import AppKit
 
-struct ContentView: View {
+public struct ContentView: View {
     @StateObject private var model = TransMangaModel()
     @ObservedObject private var store = OverlaySelectionStore.shared
     @State private var selectedTab: AppTab = .home
     @Namespace private var tabSlideNamespace
 
-    var body: some View {
+    public init() {}
+
+    public var body: some View {
         GeometryReader { geo in
             let isHome = (selectedTab == .home)
             let iconSize: CGFloat = isHome ? 230 : 78
