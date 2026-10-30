@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+VERSION="${1:-1.3.0}"
 APP_NAME="TransManga"
 BUNDLE_ID="com.2k3s.TransManga"
 APP_BUNDLE="${APP_NAME}.app"
@@ -9,7 +10,7 @@ MACOS_DIR="${CONTENTS_DIR}/MacOS"
 RESOURCES_DIR="${CONTENTS_DIR}/Resources"
 ICON_SOURCE="AppIcon.png"
 
-echo "1. Building ${APP_NAME} in Release mode..."
+echo "1. Building ${APP_NAME} v${VERSION} in Release mode..."
 swift build -c release
 
 BIN_PATH=$(swift build -c release --show-bin-path)
@@ -45,9 +46,9 @@ else
     echo "Warning: ${ICON_SOURCE} not found in $(pwd); building without custom icon."
 fi
 
-cat > "${CONTENTS_DIR}/Info.plist" <<EOF
+cat > "${CONTENTS_DIR}/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"\>
 <plist version="1.0">
 <dict>
     <key>CFBundleName</key>
@@ -57,9 +58,9 @@ cat > "${CONTENTS_DIR}/Info.plist" <<EOF
     <key>CFBundleIdentifier</key>
     <string>${BUNDLE_ID}</string>
     <key>CFBundleVersion</key>
-    <string>1.0.0</string>
+    <string>${VERSION}</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.0.0</string>
+    <string>${VERSION}</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleExecutable</key>
@@ -74,11 +75,11 @@ cat > "${CONTENTS_DIR}/Info.plist" <<EOF
     <string>TransManga captures the selected manga region on your screen to detect and translate Japanese text locally.</string>
 </dict>
 </plist>
-EOF
+PLIST
 
 echo "4. Ad-hoc signing ${APP_BUNDLE}..."
 codesign --force --deep --sign - "${APP_BUNDLE}"
 touch "${APP_BUNDLE}"
 
-echo "5. Done! Created ${APP_BUNDLE} in $(pwd)/${APP_BUNDLE}"
+echo "5. Done! Created ${APP_BUNDLE} (v${VERSION}) in $(pwd)/${APP_BUNDLE}"
 echo "   To install to /Applications, run: cp -R ${APP_BUNDLE} /Applications/"
