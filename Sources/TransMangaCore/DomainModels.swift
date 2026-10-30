@@ -1,3 +1,4 @@
+import Foundation
 import SwiftUI
 import CoreGraphics
 
@@ -20,6 +21,32 @@ enum AppTab: Int, CaseIterable, Identifiable {
         case .home: return "house.fill"
         case .log: return "text.bubble.fill"
         case .glossary: return "character.book.closed.fill"
+        }
+    }
+}
+
+enum TranslationError: LocalizedError, Equatable {
+    case invalidEndpointURL
+    case serverUnreachable
+    case modelNotInstalled(String)
+    case requestTimedOut(String)
+    case httpStatus(Int)
+    case emptyOrInvalidResponse
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidEndpointURL:
+            return "Invalid local Ollama endpoint URL."
+        case .serverUnreachable:
+            return "Cannot reach Ollama on 127.0.0.1:11434. Make sure Ollama is installed."
+        case .modelNotInstalled(let model):
+            return "Model '\(model)' is not installed. Run 'ollama pull \(model)' in Terminal."
+        case .requestTimedOut(let model):
+            return "Translation timed out waiting for '\(model)'. Try again once the model finishes loading."
+        case .httpStatus(let code):
+            return "Ollama returned HTTP \(code)."
+        case .emptyOrInvalidResponse:
+            return "Ollama returned an empty translation response."
         }
     }
 }

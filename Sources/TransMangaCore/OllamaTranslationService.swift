@@ -2,9 +2,10 @@ import Foundation
 
 // MARK: - Protocols (Interface Segregation & Dependency Inversion)
 
-protocol OllamaDaemonManaging {
+protocol OllamaDaemonManaging: Sendable {
     func isServerReachable() async -> Bool
     func ensureServerRunning() async -> Bool
+    func stopManagedServerIfNeeded() async
 }
 
 protocol MangaTranslating {
@@ -14,7 +15,7 @@ protocol MangaTranslating {
         model: String,
         glossary: [GlossaryEntry],
         recentContext: [(japanese: String, english: String)]
-    ) async -> [String]
+    ) async throws -> [String]
     func explainJapaneseBreakdown(_ japaneseText: String, model: String) async -> String
 }
 
@@ -32,9 +33,9 @@ protocol TranslationResponseParsing {
     func stripCJKCharacters(from text: String) -> String
 }
 
-// MARK: - 1. Ollama Daemon Manager (Single Responsibility: Background Server Lifecycle)
+// MARK: - 1. Ollama Daemon Manager Actor (Thread-Safe Background Server Lifecycle)
 
-final class OllamaDaemonManager: OllamaDaemonManaging {
+actor OllamaDaemonManager: OllamaDaemonManaging {
     private var backgroundProcess: Process?
 
     func isServerReachable() async -> Bool {
@@ -73,7 +74,6 @@ final class OllamaDaemonManager: OllamaDaemonManaging {
             }
         }
 
-        // Poll up to 10 times (4 seconds total) for the server to start accepting connections
         for _ in 0..<10 {
             try? await Task.sleep(nanoseconds: 400_000_000)
             if await isServerReachable() {
@@ -82,6 +82,13 @@ final class OllamaDaemonManager: OllamaDaemonManaging {
         }
 
         return await isServerReachable()
+    }
+
+    func stopManagedServerIfNeeded() {
+        if let process = backgroundProcess, process.isRunning {
+            process.terminate()
+        }
+        backgroundProcess = nil
     }
 
     private static func locateOllamaBinary() -> String? {
@@ -97,7 +104,7 @@ final class OllamaDaemonManager: OllamaDaemonManaging {
     }
 }
 
-// MARK: - 2. Prompt Builder (Single Responsibility: Prompt Construction)
+// MARK: - 2. Prompt Builder
 
 struct MangaPromptBuilder: MangaPromptBuilding {
     func buildSystemPrompt(
@@ -163,7 +170,7 @@ struct MangaPromptBuilder: MangaPromptBuilding {
     }
 }
 
-// MARK: - 3. Response Parser (Single Responsibility: Line Parsing & CJK Sanitization)
+// MARK: - 3. Response Parser
 
 struct TranslationResponseParser: TranslationResponseParsing {
     func parseNumberedLines(_ reply: String, expectedCount: Int) -> [String] {
@@ -214,7 +221,7 @@ struct TranslationResponseParser: TranslationResponseParsing {
     }
 }
 
-// MARK: - 4. Ollama Translation Service (Single Responsibility: Local HTTP Client)
+// MARK: - 4. Ollama Translation Service
 
 struct OllamaTranslationService: MangaTranslating {
     private let promptBuilder: MangaPromptBuilding
@@ -283,10 +290,10 @@ struct OllamaTranslationService: MangaTranslating {
         model: String = "qwen2.5:7b",
         glossary: [GlossaryEntry] = [],
         recentContext: [(japanese: String, english: String)] = []
-    ) async -> [String] {
+    ) async throws -> [String] {
         guard !japaneseBubbles.isEmpty else { return [] }
         guard let url = URL(string: "http://127.0.0.1:11434/api/chat") else {
-            return japaneseBubbles.map { _ in "..." }
+            throw TranslationError.invalidEndpointURL
         }
 
         let systemPrompt = promptBuilder.buildSystemPrompt(
@@ -306,24 +313,44 @@ struct OllamaTranslationService: MangaTranslating {
             options: .init(temperature: 0.15, top_p: 0.85, repeat_penalty: 1.08)
         )
 
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 90
+        request.httpBody = try JSONEncoder().encode(payload)
+
+        let data: Data
+        let response: URLResponse
         do {
-            var request = URLRequest(url: url)
-            request.httpMethod = "POST"
-            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            request.timeoutInterval = 90
-            request.httpBody = try JSONEncoder().encode(payload)
-
-            let (data, response) = try await URLSession.shared.data(for: request)
-            guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
-                return japaneseBubbles.map { _ in "..." }
+            (data, response) = try await URLSession.shared.data(for: request)
+        } catch let urlError as URLError {
+            switch urlError.code {
+            case .timedOut:
+                throw TranslationError.requestTimedOut(model)
+            case .cannotConnectToHost, .networkConnectionLost, .notConnectedToInternet:
+                throw TranslationError.serverUnreachable
+            default:
+                throw urlError
             }
-
-            let decoded = try JSONDecoder().decode(ChatResponse.self, from: data)
-            let rawReply = decoded.message.content.trimmingCharacters(in: .whitespacesAndNewlines)
-            return responseParser.parseNumberedLines(rawReply, expectedCount: japaneseBubbles.count)
-        } catch {
-            return japaneseBubbles.map { _ in "..." }
         }
+
+        guard let http = response as? HTTPURLResponse else {
+            throw TranslationError.emptyOrInvalidResponse
+        }
+        if http.statusCode == 404 {
+            throw TranslationError.modelNotInstalled(model)
+        }
+        guard http.statusCode == 200 else {
+            throw TranslationError.httpStatus(http.statusCode)
+        }
+
+        let decoded = try JSONDecoder().decode(ChatResponse.self, from: data)
+        let rawReply = decoded.message.content.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !rawReply.isEmpty else {
+            throw TranslationError.emptyOrInvalidResponse
+        }
+
+        return responseParser.parseNumberedLines(rawReply, expectedCount: japaneseBubbles.count)
     }
 
     func explainJapaneseBreakdown(
